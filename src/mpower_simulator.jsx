@@ -8,7 +8,7 @@ import {
 // ═══════════════════════════════════════════════════════════════
 // ORBITAL CONSTANTS — O3b mPOWER
 // ═══════════════════════════════════════════════════════════════
-const VERSION = "v4.6.1";
+const VERSION = "v4.6.2";
 const Re     = 6371;
 const h_orb  = 8063;
 const Rs     = Re + h_orb;
@@ -4414,7 +4414,7 @@ export default function O3bSimulator() {
           </select>
           <span style={{color:"#4a6a8a",fontSize:"9px",marginLeft:"4px"}}>SATS:</span>
           <div style={{display:"flex",gap:"1px"}}>
-            {[6,7,8,9,10,11].map(n=>(
+            {[5,6,7,8,9,10,11].map(n=>(
               <button key={n} onClick={()=>setNumSats(n)}
                 style={{background:numSats===n?"#00cfff22":"#080f1a",
                   border:`1px solid ${numSats===n?"#00cfff":"#2e4270"}`,
