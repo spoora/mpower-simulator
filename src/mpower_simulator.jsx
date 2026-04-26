@@ -8,7 +8,7 @@ import {
 // ═══════════════════════════════════════════════════════════════
 // ORBITAL CONSTANTS — O3b mPOWER
 // ═══════════════════════════════════════════════════════════════
-const VERSION = "v4.6.0";
+const VERSION = "v4.6.1";
 const Re     = 6371;
 const h_orb  = 8063;
 const Rs     = Re + h_orb;
@@ -3361,16 +3361,27 @@ export default function O3bSimulator() {
   const simTimeRef = useRef(0);
 
   // ── Responsive viewport tracking ──────────────────────────
-  const [vw, setVw] = useState(typeof window !== "undefined" ? window.innerWidth : 1280);
+  const [vw, setVw] = useState(typeof window !== "undefined" ? window.innerWidth  : 1280);
+  const [vh, setVh] = useState(typeof window !== "undefined" ? window.innerHeight : 800);
   useEffect(() => {
     if (typeof window === "undefined") return;
-    const onResize = () => setVw(window.innerWidth);
+    const onResize = () => { setVw(window.innerWidth); setVh(window.innerHeight); };
     window.addEventListener("resize", onResize);
-    return () => window.removeEventListener("resize", onResize);
+    window.addEventListener("orientationchange", onResize);
+    return () => {
+      window.removeEventListener("resize", onResize);
+      window.removeEventListener("orientationchange", onResize);
+    };
   }, []);
-  const isMobile = vw < 768;
-  const isNarrow = vw < 1024;
-  const mapHeight = isMobile ? Math.round(vw * 0.45) : isNarrow ? Math.round(vw * 0.40) : 420;
+  // Detect short viewports (mobile in landscape: e.g. iPhone 14 Pro = 852x393)
+  const isShort   = vh < 500;
+  const isMobile  = vw < 768 || isShort; // treat short landscape as mobile too
+  const isNarrow  = vw < 1024;
+  // Map height: cap by both width-proportional ratio AND a fraction of viewport height
+  // so the map never dominates the viewport on short screens (e.g. iPhone landscape)
+  const mapHeightByWidth = isMobile ? Math.round(vw * 0.45) : isNarrow ? Math.round(vw * 0.40) : 420;
+  const mapHeightByVh    = Math.round(vh * 0.55);  // never more than 55% of viewport height
+  const mapHeight = Math.max(160, Math.min(mapHeightByWidth, mapHeightByVh));
 
   const [simTime, setSimTime] = useState(0);
   const [playing,  setPlaying]  = useState(false);
