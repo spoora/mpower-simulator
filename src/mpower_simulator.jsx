@@ -8,7 +8,7 @@ import {
 // ═══════════════════════════════════════════════════════════════
 // ORBITAL CONSTANTS — O3b mPOWER
 // ═══════════════════════════════════════════════════════════════
-const VERSION = "v4.5.4";
+const VERSION = "v4.6.0";
 const Re     = 6371;
 const h_orb  = 8063;
 const Rs     = Re + h_orb;
@@ -2521,7 +2521,7 @@ function GatewayManagerTab({ activeGwIds, setActiveGwIds, simTime, numSats, gwMi
 
 // ─── end GatewayManagerTab ─────────────────────────────────────
 
-function MapCanvas({ simTime, pins, onPinDrop, gpLat, gpLon, numSats, showGwLink, flightData, onAcBubble, pathMarkers, activeGateways, gwMinEl, flightSelecting, pendingOrigin, pendingDest }) {
+function MapCanvas({ simTime, pins, onPinDrop, gpLat, gpLon, numSats, showGwLink, flightData, onAcBubble, pathMarkers, activeGateways, gwMinEl, flightSelecting, pendingOrigin, pendingDest, height }) {
   const canvasRef    = useRef(null);
   const wrapRef      = useRef(null);
   const worldRef     = useRef(null);
@@ -3154,7 +3154,14 @@ function MapCanvas({ simTime, pins, onPinDrop, gpLat, gpLon, numSats, showGwLink
   }, [ready, draw]);
 
   // ── Redraw on simTime / pins / gp changes ─────────────────
-  useEffect(() => { if (ready) draw(); }, [simTime, pins, gpLat, gpLon, numSats, showGwLink, flightData, pathMarkers, activeGateways, ready, draw]);
+  useEffect(() => { if (ready) draw(); }, [simTime, pins, gpLat, gpLon, numSats, showGwLink, flightData, pathMarkers, activeGateways, ready, draw, height]);
+  // Redraw on window resize
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const onResize = () => { if (ready) draw(); };
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, [ready, draw]);
 
   // ── Mouse handlers on wrapper div ─────────────────────────
   const handleMouseMove = useCallback((e) => {
@@ -3339,7 +3346,7 @@ function MapCanvas({ simTime, pins, onPinDrop, gpLat, gpLon, numSats, showGwLink
         style={{ cursor: (pinMode || flightSelecting) ? "crosshair" : "grab", borderRadius:"4px", overflow:"hidden",
           border:"1px solid #1e3055", userSelect:"none" }}
       >
-        <canvas ref={canvasRef} style={{ display:"block", width:"100%", height:"420px" }} />
+        <canvas ref={canvasRef} style={{ display:"block", width:"100%", height:`${height || 420}px` }} />
       </div>
     </div>
   );
@@ -3352,6 +3359,18 @@ export default function O3bSimulator() {
   const animRef    = useRef(null);
   const lastMs     = useRef(null);
   const simTimeRef = useRef(0);
+
+  // ── Responsive viewport tracking ──────────────────────────
+  const [vw, setVw] = useState(typeof window !== "undefined" ? window.innerWidth : 1280);
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const onResize = () => setVw(window.innerWidth);
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+  const isMobile = vw < 768;
+  const isNarrow = vw < 1024;
+  const mapHeight = isMobile ? Math.round(vw * 0.45) : isNarrow ? Math.round(vw * 0.40) : 420;
 
   const [simTime, setSimTime] = useState(0);
   const [playing,  setPlaying]  = useState(false);
@@ -4246,17 +4265,17 @@ export default function O3bSimulator() {
 
   // ── Styles ──────────────────────────────────────────────────
   const S = {
-    root:  {background:"#080f1a",color:"#8ab0d0",fontFamily:"'Courier New',monospace",minHeight:"100vh",padding:"12px",fontSize:"12px"},
-    hdr:   {display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:"10px",paddingBottom:"8px",borderBottom:"1px solid #1e3055"},
-    title: {fontSize:"15px",fontWeight:"bold",color:"#00cfff",letterSpacing:"0.08em"},
-    sub:   {fontSize:"10px",color:"#3a5a7a",marginTop:"3px"},
-    ctrls: {display:"flex",gap:"7px",alignItems:"center",flexWrap:"wrap"},
-    btn:   a=>({background:a?"#00cfff22":"transparent",border:`1px solid ${a?"#00cfff":"#2e4270"}`,color:a?"#00cfff":"#8ab0d0",padding:"4px 12px",borderRadius:"3px",cursor:"pointer",fontSize:"11px",fontFamily:"inherit"}),
-    sel:   {background:"#0d1a2a",border:"1px solid #2e4270",color:"#8ab0d0",padding:"3px 6px",borderRadius:"3px",fontSize:"11px",fontFamily:"inherit"},
-    time:  {color:"#00cfff",fontSize:"13px",fontWeight:"bold",background:"#0d1a2a",padding:"3px 10px",border:"1px solid #2e4270",borderRadius:"3px"},
-    tabs:  {display:"flex",gap:"2px",marginBottom:"0"},
-    tab:   a=>({padding:"5px 14px",cursor:"pointer",background:a?"#0d1a2a":"transparent",borderTop:`1px solid ${a?"#00cfff":"#2e4270"}`,borderLeft:`1px solid ${a?"#00cfff":"#2e4270"}`,borderRight:`1px solid ${a?"#00cfff":"#2e4270"}`,borderBottom:a?"1px solid #0d1a2a":"1px solid #2e4270",color:a?"#00cfff":"#4a6a8a",fontSize:"11px",borderRadius:"3px 3px 0 0"}),
-    body:  {border:"1px solid #2e4270",borderRadius:"0 3px 3px 3px",padding:"10px",background:"#0d1a2a"},
+    root:  {background:"#080f1a",color:"#8ab0d0",fontFamily:"'Courier New',monospace",minHeight:"100vh",padding:isMobile?"6px":"12px",fontSize:isMobile?"11px":"12px"},
+    hdr:   {display:"flex",alignItems:isMobile?"flex-start":"center",justifyContent:"space-between",marginBottom:"10px",paddingBottom:"8px",borderBottom:"1px solid #1e3055",flexDirection:isMobile?"column":"row",gap:isMobile?"8px":"0"},
+    title: {fontSize:isMobile?"13px":"15px",fontWeight:"bold",color:"#00cfff",letterSpacing:"0.08em"},
+    sub:   {fontSize:isMobile?"9px":"10px",color:"#3a5a7a",marginTop:"3px"},
+    ctrls: {display:"flex",gap:isMobile?"4px":"7px",alignItems:"center",flexWrap:"wrap"},
+    btn:   a=>({background:a?"#00cfff22":"transparent",border:`1px solid ${a?"#00cfff":"#2e4270"}`,color:a?"#00cfff":"#8ab0d0",padding:isMobile?"3px 8px":"4px 12px",borderRadius:"3px",cursor:"pointer",fontSize:isMobile?"10px":"11px",fontFamily:"inherit"}),
+    sel:   {background:"#0d1a2a",border:"1px solid #2e4270",color:"#8ab0d0",padding:"3px 6px",borderRadius:"3px",fontSize:isMobile?"10px":"11px",fontFamily:"inherit"},
+    time:  {color:"#00cfff",fontSize:isMobile?"11px":"13px",fontWeight:"bold",background:"#0d1a2a",padding:"3px 10px",border:"1px solid #2e4270",borderRadius:"3px"},
+    tabs:  {display:"flex",gap:"2px",marginBottom:"0",overflowX:"auto",WebkitOverflowScrolling:"touch",scrollbarWidth:"thin"},
+    tab:   a=>({padding:isMobile?"4px 8px":"5px 14px",cursor:"pointer",background:a?"#0d1a2a":"transparent",borderTop:`1px solid ${a?"#00cfff":"#2e4270"}`,borderLeft:`1px solid ${a?"#00cfff":"#2e4270"}`,borderRight:`1px solid ${a?"#00cfff":"#2e4270"}`,borderBottom:a?"1px solid #0d1a2a":"1px solid #2e4270",color:a?"#00cfff":"#4a6a8a",fontSize:isMobile?"10px":"11px",borderRadius:"3px 3px 0 0",whiteSpace:"nowrap",flexShrink:0}),
+    body:  {border:"1px solid #2e4270",borderRadius:"0 3px 3px 3px",padding:isMobile?"6px":"10px",background:"#0d1a2a"},
     grid2: {display:"grid",gridTemplateColumns:"1fr 1fr",gap:"12px"},
     card:  hi=>({background:"#080f1a",border:`1px solid ${hi?"#00cfff44":"#2e4270"}`,borderRadius:"4px",padding:"10px"}),
     lbl:   {color:"#4a6a8a",fontSize:"10px",marginBottom:"4px"},
@@ -4725,7 +4744,7 @@ export default function O3bSimulator() {
             </div>
 
             {/* D3 Canvas Map */}
-            <MapCanvas simTime={simTime} pins={pins} onPinDrop={onPinDrop} gpLat={gpLat} gpLon={gpLon} numSats={numSats} showGwLink={showGwLink} flightData={flightData} onAcBubble={setAcBubble} pathMarkers={pathMarkers} activeGateways={activeGateways} gwMinEl={gwMinEl} flightSelecting={flightSelecting} pendingOrigin={flightOrigin} pendingDest={flightDest} />
+            <MapCanvas simTime={simTime} pins={pins} onPinDrop={onPinDrop} gpLat={gpLat} gpLon={gpLon} numSats={numSats} showGwLink={showGwLink} flightData={flightData} onAcBubble={setAcBubble} pathMarkers={pathMarkers} activeGateways={activeGateways} gwMinEl={gwMinEl} flightSelecting={flightSelecting} pendingOrigin={flightOrigin} pendingDest={flightDest} height={mapHeight} />
 
             {/* ── Aircraft Link Status Panel (below map) ── */}
             {acBubble && (() => {
