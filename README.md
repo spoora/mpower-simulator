@@ -36,3 +36,4 @@ Output goes to `dist/` — deployable to any static host.
 ## License
 
 MIT
+
