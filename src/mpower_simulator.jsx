@@ -8,7 +8,7 @@ import {
 // ═══════════════════════════════════════════════════════════════
 // ORBITAL CONSTANTS — O3b mPOWER
 // ═══════════════════════════════════════════════════════════════
-const VERSION = "v4.8.0";
+const VERSION = "v4.9.0";
 const Re     = 6371;
 const h_orb  = 8063;
 const Rs     = Re + h_orb;
@@ -858,7 +858,7 @@ function beamFootprintPolygon(termLat, termLon, satLonDeg, elDeg, beamHalfDeg, n
   return { type: "Feature", geometry: { type: "Polygon", coordinates: [pts] } };
 }
 
-function BeamProjectionTab({ simTime, numSats, satNames, gpLat, gpLon }) {
+function BeamProjectionTab({ simTime, numSats, satNames, gpLat, gpLon, flightActive, flightInfo }) {
   const canvasRef  = useRef(null);
   const worldRef   = useRef(null);
   const dragRef    = useRef(null);
@@ -884,7 +884,26 @@ function BeamProjectionTab({ simTime, numSats, satNames, gpLat, gpLon }) {
   const [mapCenter,    setMapCenter]    = useState([0, 0]);
   const [kmlOutput,    setKmlOutput]    = useState(null);  // KML text shown in-UI
 
-  useEffect(() => { setTermLat(gpLat); setTermLon(gpLon); }, [gpLat, gpLon]);
+  // Track-flight mode: when active, terminal lat/lon follows the analysis point
+  // (which itself follows the aircraft when a flight is in progress).
+  // Defaults ON when a flight is active; flips OFF if user manually edits term values.
+  const [trackFlight, setTrackFlight] = useState(true);
+  // Auto-enable trackFlight when a new flight starts
+  const prevFlightActive = useRef(flightActive);
+  useEffect(() => {
+    if (flightActive && !prevFlightActive.current) setTrackFlight(true);
+    prevFlightActive.current = flightActive;
+  }, [flightActive]);
+  // Sync term lat/lon to analysis point when tracking
+  useEffect(() => {
+    if (trackFlight && flightActive) {
+      setTermLat(+gpLat.toFixed(3));
+      setTermLon(+gpLon.toFixed(3));
+    } else if (!flightActive) {
+      // No flight: sync once on mount/gpLat-change as before
+      setTermLat(gpLat); setTermLon(gpLon);
+    }
+  }, [gpLat, gpLon, trackFlight, flightActive]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1307,22 +1326,45 @@ function BeamProjectionTab({ simTime, numSats, satNames, gpLat, gpLon }) {
 
           <div style={panelStyle}>
             <div style={secStyle}>TERMINAL LOCATION</div>
+            {flightActive && (
+              <label style={{display:"flex",alignItems:"center",gap:"6px",marginBottom:"8px",
+                padding:"6px 8px",background:trackFlight?"#0d1a14":"#080f1a",
+                border:`1px solid ${trackFlight?"#00ff88":"#2e4270"}`,borderRadius:"3px",cursor:"pointer"}}>
+                <input type="checkbox" checked={trackFlight}
+                  onChange={function(e){setTrackFlight(e.target.checked);}}
+                  style={{accentColor:"#00ff88",width:"12px",height:"12px",cursor:"pointer"}} />
+                <span style={{color:trackFlight?"#00ff88":"#8ab0d0",fontSize:"10px",fontWeight:"bold",letterSpacing:"0.04em"}}>
+                  ✈ TRACK FLIGHT
+                </span>
+                {trackFlight && flightInfo?.callsign && (
+                  <span style={{color:"#5a9a7a",fontSize:"9px",marginLeft:"auto"}}>
+                    {flightInfo.callsign}
+                  </span>
+                )}
+              </label>
+            )}
             <div style={{marginBottom:"6px"}}>
               <label style={labelStyle}>Longitude (deg)</label>
               <input type="number" min={-180} max={180} step={0.0001} value={termLon}
-                onChange={function(e){setTermLon(+e.target.value);}} style={inputStyle}/>
+                disabled={trackFlight && flightActive}
+                onChange={function(e){setTermLon(+e.target.value);}}
+                style={{...inputStyle,
+                  ...(trackFlight && flightActive?{borderColor:"#00ff88",background:"#0d1a14",color:"#00ff88",cursor:"not-allowed"}:{})}}/>
             </div>
             <div style={{marginBottom:"6px"}}>
               <label style={labelStyle}>Latitude (deg)</label>
               <input type="number" min={-55} max={55} step={0.0001} value={termLat}
-                onChange={function(e){setTermLat(+e.target.value);}} style={inputStyle}/>
+                disabled={trackFlight && flightActive}
+                onChange={function(e){setTermLat(+e.target.value);}}
+                style={{...inputStyle,
+                  ...(trackFlight && flightActive?{borderColor:"#00ff88",background:"#0d1a14",color:"#00ff88",cursor:"not-allowed"}:{})}}/>
             </div>
             <div style={{marginBottom:"8px"}}>
               <label style={labelStyle}>UT Altitude (km)</label>
               <input type="number" min={0} max={12} step={0.1} value={termAlt}
                 onChange={function(e){setTermAlt(+e.target.value);}} style={inputStyle}/>
             </div>
-            <button onClick={function(){setTermLat(gpLat);setTermLon(gpLon);}}
+            <button onClick={function(){setTrackFlight(false);setTermLat(gpLat);setTermLon(gpLon);}}
               style={{...btnStyle,width:"100%",color:"#00cfff",border:"1px solid #00cfff44",background:"#00cfff11"}}>
               Use Analysis Point
             </button>
@@ -4768,24 +4810,40 @@ export default function O3bSimulator() {
 
   const chartT = {background:"#080f1a",border:"1px solid #2e4270",fontSize:"10px",fontFamily:"'Courier New',monospace"};
 
-  const gpControls = useMemo(() => (
-    <div style={{display:"flex",gap:"16px",alignItems:"center",marginBottom:"12px",flexWrap:"wrap"}}>
-      <span style={{color:"#4a6a8a"}}>ANALYSIS POINT:</span>
-      <label style={{color:"#8ab0d0"}}>Lat
-        <input type="number" min={-55} max={55} value={gpLat}
-          onChange={e=>setGpLat(+e.target.value)} style={{...S.inp,marginLeft:"6px"}} />
-      </label>
-      <label style={{color:"#8ab0d0"}}>Lon
-        <input type="number" min={-180} max={180} value={gpLon}
-          onChange={e=>setGpLon(+e.target.value)} style={{...S.inp,marginLeft:"6px"}} />
-      </label>
-      {selectedCity && (
-        <span style={{color:"#00cfff",fontSize:"10px",background:"#00cfff15",border:"1px solid #00cfff44",padding:"2px 8px",borderRadius:"3px"}}>
-          📍 {selectedCity}
-        </span>
-      )}
-    </div>
-  ), [gpLat, gpLon, selectedCity]);
+  const gpControls = useMemo(() => {
+    const tracking = flightData && !flightData.complete;
+    return (
+      <div style={{display:"flex",gap:"16px",alignItems:"center",marginBottom:"12px",flexWrap:"wrap"}}>
+        <span style={{color:"#4a6a8a"}}>ANALYSIS POINT:</span>
+        <label style={{color:tracking?"#5a7a9a":"#8ab0d0"}}>Lat
+          <input type="number" min={-55} max={55} value={gpLat}
+            disabled={tracking}
+            onChange={e=>setGpLat(+e.target.value)}
+            style={{...S.inp,marginLeft:"6px",
+              ...(tracking?{borderColor:"#00ff88",background:"#0d1a14",color:"#00ff88",cursor:"not-allowed"}:{})}} />
+        </label>
+        <label style={{color:tracking?"#5a7a9a":"#8ab0d0"}}>Lon
+          <input type="number" min={-180} max={180} value={gpLon}
+            disabled={tracking}
+            onChange={e=>setGpLon(+e.target.value)}
+            style={{...S.inp,marginLeft:"6px",
+              ...(tracking?{borderColor:"#00ff88",background:"#0d1a14",color:"#00ff88",cursor:"not-allowed"}:{})}} />
+        </label>
+        {tracking && (
+          <span style={{color:"#00ff88",fontSize:"10px",fontWeight:"bold",background:"#00ff8815",
+            border:"1px solid #00ff88",padding:"2px 8px",borderRadius:"3px",letterSpacing:"0.05em"}}>
+            ✈ TRACKING FLIGHT — {flightData.isReal ? `${flightData.callsign||"real"} ` : ""}
+            {(flightData.progress*100).toFixed(0)}%
+          </span>
+        )}
+        {selectedCity && !tracking && (
+          <span style={{color:"#00cfff",fontSize:"10px",background:"#00cfff15",border:"1px solid #00cfff44",padding:"2px 8px",borderRadius:"3px"}}>
+            📍 {selectedCity}
+          </span>
+        )}
+      </div>
+    );
+  }, [gpLat, gpLon, selectedCity, flightData]);
 
   // City search filter — instant local matching
   const filteredCities = useMemo(() => {
@@ -6970,6 +7028,11 @@ export default function O3bSimulator() {
             satNames={satNames}
             gpLat={gpLat}
             gpLon={gpLon}
+            flightActive={!!(flightData && !flightData.complete)}
+            flightInfo={flightData ? {
+              callsign: flightData.isReal ? (flightData.callsign || "real flight") : `${flightData.origin?.iata||""} → ${flightData.dest?.iata||""}`,
+              progress: flightData.progress,
+            } : null}
           />
         )}
 
