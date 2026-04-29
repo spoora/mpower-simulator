@@ -8,7 +8,7 @@ import {
 // ═══════════════════════════════════════════════════════════════
 // ORBITAL CONSTANTS — O3b mPOWER
 // ═══════════════════════════════════════════════════════════════
-const VERSION = "v4.7.1";
+const VERSION = "v4.8.0";
 const Re     = 6371;
 const h_orb  = 8063;
 const Rs     = Re + h_orb;
@@ -521,6 +521,166 @@ const REAL_FLIGHT_AIRPORTS = [
   {icao:"YPPH",iata:"PER",city:"Perth",lat:-31.9402,lon:115.9669},
   {icao:"NZAA",iata:"AKL",city:"Auckland",lat:-37.0082,lon:174.7917},
 ];
+
+// Airline ICAO callsign prefix → operator name. Used to display friendly
+// names in the flight results list, e.g. "BAW286" → "British Airways · 286"
+const AIRLINE_NAMES = {
+  AAL:"American",ACA:"Air Canada",AFL:"Aeroflot",AFR:"Air France",AMX:"AeroMexico",
+  ANA:"All Nippon",ANE:"Air Nostrum",ASA:"Alaska",ASH:"Mesa",AUA:"Austrian",
+  AVA:"Avianca",AZA:"ITA Airways",BAW:"British Airways",BLA:"Blue Air",BOX:"Aerologic",
+  BTI:"airBaltic",CAL:"China Airlines",CCA:"Air China",CES:"China Eastern",CFG:"Condor",
+  CKS:"Kalitta",CLX:"Cargolux",CPA:"Cathay Pacific",CSC:"Sichuan Airlines",CSN:"China Southern",
+  CSZ:"Shenzhen",DAL:"Delta",DLH:"Lufthansa",EDV:"Endeavor",EIN:"Aer Lingus",
+  EJA:"NetJets",ELY:"El Al",ETD:"Etihad",ETH:"Ethiopian",EUK:"easyJet UK",
+  EVA:"EVA Air",EZS:"easyJet Switzerland",EZY:"easyJet",FDX:"FedEx",FFT:"Frontier",
+  FIN:"Finnair",GEC:"Lufthansa Cargo",GJS:"GoJet",GLO:"Gol",GTI:"Atlas Air",
+  HAL:"Hawaiian",IBE:"Iberia",ICE:"Icelandair",ITY:"ITA Airways",JAL:"Japan Airlines",
+  JBU:"JetBlue",JIA:"PSA Airlines",JZA:"Jazz",KAL:"Korean Air",KLM:"KLM",
+  LAN:"LATAM Chile",LOT:"LOT",LXJ:"Flexjet",MEA:"Middle East Air",MPH:"Martinair",
+  MSR:"EgyptAir",NJE:"NetJets Europe",NKS:"Spirit",NOS:"Neos",NOZ:"Norse Atlantic",
+  PGT:"Pegasus",QFA:"Qantas",QTR:"Qatar Airways",RAM:"Royal Air Maroc",ROT:"TAROM",
+  RPA:"Republic",RYR:"Ryanair",SAS:"Scandinavian",SAA:"South African",SIA:"Singapore",
+  SKW:"SkyWest",SQC:"Singapore Cargo",SVA:"Saudia",SWA:"Southwest",SWR:"Swiss",
+  SYR:"Syrianair",TAM:"LATAM Brasil",TAP:"TAP Portugal",THA:"Thai Airways",THY:"Turkish",
+  TRA:"Transavia",TVF:"Transavia France",UAE:"Emirates",UAL:"United",UBT:"Tui Belgium",
+  UCA:"Commutair",UPS:"UPS",VIR:"Virgin Atlantic",VOI:"Volaris",VRD:"Virgin America",
+  VLG:"Vueling",WJA:"WestJet",WUP:"Western Global",XAX:"AirAsia X",ZSAAK:"South African",
+};
+
+// Friendly name for any airport ICAO code (just for displaying in result list).
+// Bigger than REAL_FLIGHT_AIRPORTS — covers many destinations users won't search FROM
+// but want to recognize as a destination.
+const DEST_AIRPORT_NAMES = {
+  // North America
+  KJFK:"New York JFK",KEWR:"Newark",KLGA:"New York LGA",KBOS:"Boston",KIAD:"Washington Dulles",
+  KDCA:"Washington Reagan",KATL:"Atlanta",KMIA:"Miami",KMCO:"Orlando",KFLL:"Fort Lauderdale",
+  KORD:"Chicago O'Hare",KMDW:"Chicago Midway",KDFW:"Dallas FW",KDAL:"Dallas Love",KIAH:"Houston IAH",
+  KHOU:"Houston Hobby",KDEN:"Denver",KLAX:"Los Angeles",KSFO:"San Francisco",KSEA:"Seattle",
+  KLAS:"Las Vegas",KPHX:"Phoenix",KSAN:"San Diego",KSAT:"San Antonio",KAUS:"Austin",
+  KSLC:"Salt Lake City",KMSP:"Minneapolis",KDTW:"Detroit",KCLT:"Charlotte",KCLE:"Cleveland",
+  KIND:"Indianapolis",KPHL:"Philadelphia",KPIT:"Pittsburgh",KBNA:"Nashville",KMEM:"Memphis",
+  KMSY:"New Orleans",KTPA:"Tampa",KRDU:"Raleigh-Durham",KCVG:"Cincinnati",KSTL:"St Louis",
+  KMCI:"Kansas City",KMKE:"Milwaukee",KOMA:"Omaha",KBUF:"Buffalo",KROC:"Rochester",
+  KCHS:"Charleston",KSAV:"Savannah",KJAX:"Jacksonville",KPBI:"West Palm Beach",KRSW:"Fort Myers",
+  KABQ:"Albuquerque",KELP:"El Paso",KTUS:"Tucson",KOAK:"Oakland",KSJC:"San Jose",
+  KSMF:"Sacramento",KSNA:"Orange County",KPDX:"Portland",KBOI:"Boise",KGEG:"Spokane",
+  KANC:"Anchorage",KFAI:"Fairbanks",PHNL:"Honolulu",PHKO:"Kona",PHTO:"Hilo",
+  KMDT:"Harrisburg",KLCK:"Columbus Rickenbacker",
+  CYYZ:"Toronto",CYUL:"Montreal",CYVR:"Vancouver",CYYC:"Calgary",CYEG:"Edmonton",
+  CYOW:"Ottawa",CYHZ:"Halifax",CYWG:"Winnipeg",CYQB:"Quebec City",
+  MMMX:"Mexico City",MMUN:"Cancun",MMGL:"Guadalajara",MMMY:"Monterrey",MMSD:"Los Cabos",
+  MMPR:"Puerto Vallarta",MMTJ:"Tijuana",
+  MGGT:"Guatemala City",MROC:"San Jose CR",MPTO:"Panama City",MSLP:"San Salvador",
+  MNMG:"Managua",MHLM:"San Pedro Sula",MHTG:"Tegucigalpa",
+  TJSJ:"San Juan",TJBQ:"Aguadilla",TFFF:"Martinique",TFFR:"Guadeloupe",TBPB:"Barbados",
+  TKPK:"St Kitts",TXKF:"Bermuda",MKJP:"Kingston",MKJS:"Montego Bay",MDPC:"Punta Cana",
+  MDSD:"Santo Domingo",MUHA:"Havana",MWCR:"Grand Cayman",MYNN:"Nassau",
+  // South America
+  SBGR:"Sao Paulo Guarulhos",SBGL:"Rio Galeao",SBSP:"Sao Paulo Congonhas",SBBR:"Brasilia",
+  SBKP:"Campinas",SBSV:"Salvador",SBRF:"Recife",SBFZ:"Fortaleza",SBPA:"Porto Alegre",
+  SAEZ:"Buenos Aires Ezeiza",SAAR:"Rosario",SCEL:"Santiago",SPJC:"Lima",SPZO:"Cusco",
+  SKBO:"Bogota",SKCG:"Cartagena",SVMI:"Caracas",SUMU:"Montevideo",SEQM:"Quito",SEGU:"Guayaquil",
+  // Europe
+  EGLL:"London Heathrow",EGKK:"London Gatwick",EGLC:"London City",EGSS:"London Stansted",
+  EGGW:"London Luton",EGCC:"Manchester",EGBB:"Birmingham",EGGD:"Bristol",EGGP:"Liverpool",
+  EGNX:"East Midlands",EGNT:"Newcastle",EGPH:"Edinburgh",EGPF:"Glasgow",EGAA:"Belfast",
+  EIDW:"Dublin",EICK:"Cork",EINN:"Shannon",
+  LFPG:"Paris CDG",LFPO:"Paris Orly",LFLL:"Lyon",LFMN:"Nice",LFML:"Marseille",
+  LFBO:"Toulouse",LFBD:"Bordeaux",LFRS:"Nantes",LFST:"Strasbourg",
+  EDDF:"Frankfurt",EDDM:"Munich",EDDB:"Berlin",EDDL:"Dusseldorf",EDDH:"Hamburg",
+  EDDK:"Cologne",EDDS:"Stuttgart",EDDN:"Nuremberg",EDDV:"Hannover",EDDT:"Berlin Tegel",
+  EHAM:"Amsterdam",EHRD:"Rotterdam",EHEH:"Eindhoven",
+  EBBR:"Brussels",EBLG:"Liege",EBCI:"Charleroi",ELLX:"Luxembourg",
+  LSZH:"Zurich",LSGG:"Geneva",LSZB:"Bern",LSZA:"Lugano",
+  LOWW:"Vienna",LOWS:"Salzburg",LOWI:"Innsbruck",
+  LIRF:"Rome Fiumicino",LIRA:"Rome Ciampino",LIMC:"Milan Malpensa",LIML:"Milan Linate",
+  LIPZ:"Venice Marco Polo",LIPE:"Bologna",LIRN:"Naples",LICC:"Catania",LICJ:"Palermo",
+  LEMD:"Madrid",LEBL:"Barcelona",LEPA:"Palma de Mallorca",LEMG:"Malaga",LEAL:"Alicante",
+  LEVC:"Valencia",LEZL:"Seville",LEBB:"Bilbao",GCLP:"Las Palmas",GCXO:"Tenerife North",
+  GCTS:"Tenerife South",GCFV:"Fuerteventura",
+  LPPT:"Lisbon",LPPR:"Porto",LPMA:"Madeira",LPFR:"Faro",LPLA:"Azores",
+  LGAV:"Athens",LGTS:"Thessaloniki",LGIR:"Heraklion",LGRP:"Rhodes",
+  LMML:"Malta",LCLK:"Larnaca",LCPH:"Paphos",
+  EKCH:"Copenhagen",EKBI:"Billund",ESSA:"Stockholm Arlanda",ESGG:"Gothenburg",
+  ENGM:"Oslo",ENBR:"Bergen",ENVA:"Trondheim",EFHK:"Helsinki",BIKF:"Reykjavik Keflavik",
+  EPWA:"Warsaw",EPKK:"Krakow",EPGD:"Gdansk",
+  LKPR:"Prague",LZIB:"Bratislava",LHBP:"Budapest",
+  LROP:"Bucharest",LBSF:"Sofia",LWSK:"Skopje",LYBE:"Belgrade",LDZA:"Zagreb",LJLJ:"Ljubljana",
+  LTBA:"Istanbul Ataturk",LTFM:"Istanbul New",LTAC:"Ankara",LTAI:"Antalya",LTBJ:"Izmir",
+  UUEE:"Moscow Sheremetyevo",UUDD:"Moscow Domodedovo",UUWW:"Moscow Vnukovo",ULLI:"St Petersburg",
+  UKBB:"Kyiv Boryspil",
+  // Middle East / Africa
+  OMDB:"Dubai",OMDW:"Dubai World Central",OMAA:"Abu Dhabi",OMSJ:"Sharjah",OMAD:"Al Bateen",
+  OTHH:"Doha",OBBI:"Bahrain",OEJN:"Jeddah",OERK:"Riyadh",OEDF:"Dammam",
+  OEMA:"Medina",OOMS:"Muscat",OKBK:"Kuwait",
+  LLBG:"Tel Aviv",OJAI:"Amman",OLBA:"Beirut",OSDI:"Damascus",
+  HECA:"Cairo",HEGN:"Hurghada",HESH:"Sharm el-Sheikh",HKJK:"Nairobi",HKMO:"Mombasa",
+  HUEN:"Entebbe",HAAB:"Addis Ababa",HRYR:"Kigali",HTDA:"Dar es Salaam",HTKJ:"Kilimanjaro",
+  HSSS:"Khartoum",DNMM:"Lagos",DNAA:"Abuja",DGAA:"Accra",DIAP:"Abidjan",GOOY:"Dakar",
+  GMMN:"Casablanca",GMME:"Rabat",DAAG:"Algiers",DTTA:"Tunis",HLLT:"Tripoli",
+  FAOR:"Johannesburg",FACT:"Cape Town",FALE:"Durban",FAPE:"Port Elizabeth",FBSK:"Gaborone",
+  FBKE:"Kasane",FVHA:"Harare",FVRG:"Victoria Falls",FYWH:"Windhoek",FMMI:"Antananarivo",
+  FMEE:"Reunion",FIMP:"Mauritius",
+  // Asia
+  VIDP:"Delhi",VABB:"Mumbai",VOMM:"Chennai",VOBL:"Bangalore",VOHS:"Hyderabad",
+  VOCI:"Kochi",VOCB:"Coimbatore",VOTV:"Trivandrum",VECC:"Kolkata",VAAH:"Ahmedabad",
+  VOGO:"Goa",VOMM:"Madras",VOTR:"Tiruchirappalli",VEBN:"Varanasi",VEPT:"Patna",
+  VAJJ:"Pune",VANP:"Nagpur",
+  VHHH:"Hong Kong",VMMC:"Macau",ZBAA:"Beijing Capital",ZBAD:"Beijing Daxing",ZSPD:"Shanghai Pudong",
+  ZSSS:"Shanghai Hongqiao",ZGGG:"Guangzhou",ZGSZ:"Shenzhen",ZUUU:"Chengdu",ZSHC:"Hangzhou",
+  ZGHA:"Changsha",ZSAM:"Xiamen",ZJHK:"Haikou",ZBTJ:"Tianjin",ZLXY:"Xian",ZWWW:"Urumqi",
+  RJTT:"Tokyo Haneda",RJAA:"Tokyo Narita",RJBB:"Osaka Kansai",RJOO:"Osaka Itami",RJOA:"Hiroshima",
+  RJCC:"Sapporo",RJFF:"Fukuoka",RJOH:"Hofu",RJSN:"Niigata",
+  RKSI:"Seoul Incheon",RKSS:"Seoul Gimpo",RKPC:"Jeju",RKPK:"Busan",
+  RPLL:"Manila",RPMD:"Davao",RPVM:"Mactan-Cebu",
+  WSSS:"Singapore",WMKK:"Kuala Lumpur",WMSA:"Subang",WBSB:"Bandar Seri Begawan",
+  VTBS:"Bangkok Suvarnabhumi",VTBD:"Bangkok Don Mueang",VTSP:"Phuket",VTCC:"Chiang Mai",
+  VVNB:"Hanoi",VVTS:"Ho Chi Minh City",VDPP:"Phnom Penh",VLVT:"Vientiane",
+  WIII:"Jakarta",WIDD:"Batam",WADD:"Denpasar Bali",WAJJ:"Jayapura",WALL:"Balikpapan",WAMM:"Manado",
+  VNKT:"Kathmandu",VTSE:"Hat Yai",VYYY:"Yangon",VCBI:"Colombo",VRMM:"Male",
+  // Pacific / Australia
+  YSSY:"Sydney",YMML:"Melbourne",YBBN:"Brisbane",YPPH:"Perth",YPAD:"Adelaide",
+  YBCG:"Gold Coast",YBCS:"Cairns",YPDN:"Darwin",YBHM:"Hamilton Island",YMHB:"Hobart",
+  NZAA:"Auckland",NZWN:"Wellington",NZCH:"Christchurch",NZQN:"Queenstown",
+  NFFN:"Nadi Fiji",NSFA:"Apia Samoa",NTAA:"Papeete",NFTF:"Tonga",AYPY:"Port Moresby",
+  // Cargo / niche
+  KSDF:"Louisville UPS Hub",KCVG:"Cincinnati DHL",
+};
+
+// Pretty-print a callsign by splitting "ABC1234 " → "Airline Name · 1234"
+function prettyCallsign(callsign) {
+  if (!callsign) return "—";
+  const c = callsign.trim();
+  if (c.length < 3) return c;
+  const prefix = c.substring(0, 3).toUpperCase();
+  const suffix = c.substring(3).trim();
+  const airline = AIRLINE_NAMES[prefix];
+  if (!airline) return c;
+  return suffix ? `${airline} ${suffix}` : airline;
+}
+
+// Friendly destination name from any ICAO airport code; falls back to the code itself
+function prettyAirport(icao) {
+  if (!icao) return "—";
+  const fromHubs = REAL_FLIGHT_AIRPORTS.find(a => a.icao === icao);
+  if (fromHubs) return fromHubs.city;
+  return DEST_AIRPORT_NAMES[icao] || icao;
+}
+
+// localStorage keys for recent searches/flights
+const LS_RECENT_AIRPORTS = "mpower_recent_airports";
+const LS_RECENT_FLIGHTS  = "mpower_recent_flights";
+
+// Safe localStorage helpers
+function lsGet(key, fallback) {
+  try {
+    const raw = typeof localStorage !== "undefined" ? localStorage.getItem(key) : null;
+    return raw ? JSON.parse(raw) : fallback;
+  } catch { return fallback; }
+}
+function lsSet(key, value) {
+  try { if (typeof localStorage !== "undefined") localStorage.setItem(key, JSON.stringify(value)); } catch {}
+}
 
 // Great circle distance in km between two lat/lon points
 function gcDist(lat1, lon1, lat2, lon2) {
@@ -3512,6 +3672,9 @@ export default function O3bSimulator() {
   const [aptQReal,          setAptQReal]          = useState("");
   const [aptOpenReal,       setAptOpenReal]       = useState(false);
   const aptRefReal = useRef(null);
+  const [resultsFilter,     setResultsFilter]     = useState(""); // (A) live filter on results
+  const [recentAirports,    setRecentAirports]    = useState(() => lsGet(LS_RECENT_AIRPORTS, [])); // (E) persisted
+  const [recentFlights,     setRecentFlights]     = useState(() => lsGet(LS_RECENT_FLIGHTS, []));
   const [flightSelecting, setFlightSelecting_] = useState(null); // "origin" | "dest" | null
   // Wrapper keeps the ref in sync for the onPinDrop closure
   function setFlightSelecting(v) { flightSelectingRef.current = v; setFlightSelecting_(v); }
@@ -3613,6 +3776,11 @@ export default function O3bSimulator() {
       // Sort by departure time
       filtered.sort((a, b) => a.firstSeen - b.firstSeen);
       setRealFlightResults(filtered);
+      setResultsFilter("");
+      // Persist airport in recent list (most-recent-first, dedup, max 8)
+      const updated = [icao, ...recentAirports.filter(x => x !== icao)].slice(0, 8);
+      setRecentAirports(updated);
+      lsSet(LS_RECENT_AIRPORTS, updated);
     } catch (err) {
       setRealFlightError(`Search failed: ${err.message}`);
       setRealFlightResults("error:" + err.message);
@@ -3687,6 +3855,19 @@ export default function O3bSimulator() {
       setRealFlightSelected(flight);
       setFlightOrigin(orig);
       setFlightDest(dest);
+      // Persist favourite/recent flight (dedup by callsign+date, most-recent-first, max 5)
+      const fav = {
+        icao24: flight.icao24,
+        callsign: (flight.callsign || "").trim(),
+        from: flight.estDepartureAirport,
+        to:   flight.estArrivalAirport,
+        firstSeen: flight.firstSeen,
+        lastSeen:  flight.lastSeen,
+      };
+      const dedupKey = (f) => `${f.callsign}|${f.firstSeen}`;
+      const updatedFlights = [fav, ...recentFlights.filter(f => dedupKey(f) !== dedupKey(fav))].slice(0, 5);
+      setRecentFlights(updatedFlights);
+      lsSet(LS_RECENT_FLIGHTS, updatedFlights);
     } catch (err) {
       setRealFlightError(`Track load failed: ${err.message}`);
     } finally {
@@ -5095,6 +5276,58 @@ export default function O3bSimulator() {
                     )}
                   </div>
 
+                  {/* (E) Recent airport quick-pick chips */}
+                  {realFlightMode && recentAirports.length > 0 && !realFlightTrack && (
+                    <div style={{marginTop:"6px",display:"flex",alignItems:"center",gap:"6px",flexWrap:"wrap"}}>
+                      <span style={{color:"#4a6a8a",fontSize:"9px",letterSpacing:"0.05em"}}>RECENT:</span>
+                      {recentAirports.map(icao => {
+                        const apt = REAL_FLIGHT_AIRPORTS.find(a => a.icao === icao);
+                        const label = apt ? `${apt.iata} ${apt.city}` : icao;
+                        return (
+                          <button key={icao} onClick={() => {
+                            setRealFlightSearch({ ...realFlightSearch, airport: icao });
+                            setAptQReal(apt ? `${apt.icao} – ${apt.city}` : icao);
+                          }} style={{background:"#0d1a2a",border:"1px solid #2e4270",color:"#8ab0d0",
+                            padding:"2px 8px",borderRadius:"10px",cursor:"pointer",fontSize:"9px",
+                            fontFamily:"inherit"}}>
+                            {label}
+                          </button>
+                        );
+                      })}
+                      <button onClick={() => { setRecentAirports([]); lsSet(LS_RECENT_AIRPORTS, []); }}
+                        style={{background:"transparent",border:"none",color:"#4a6a8a",cursor:"pointer",
+                          fontSize:"9px",textDecoration:"underline"}}>
+                        clear
+                      </button>
+                    </div>
+                  )}
+
+                  {/* (E) Recent flight chips - one-click re-load */}
+                  {realFlightMode && recentFlights.length > 0 && !realFlightTrack && (
+                    <div style={{marginTop:"6px",display:"flex",alignItems:"center",gap:"6px",flexWrap:"wrap"}}>
+                      <span style={{color:"#4a6a8a",fontSize:"9px",letterSpacing:"0.05em"}}>RECENT FLIGHTS:</span>
+                      {recentFlights.map((f, i) => {
+                        const date = new Date(f.firstSeen * 1000).toISOString().slice(5, 10); // MM-DD
+                        return (
+                          <button key={i} onClick={() => loadRealFlightTrack({
+                            icao24: f.icao24, callsign: f.callsign,
+                            estDepartureAirport: f.from, estArrivalAirport: f.to,
+                            firstSeen: f.firstSeen, lastSeen: f.lastSeen,
+                          })} style={{background:"#0d1a2a",border:"1px solid #00cfff44",color:"#00cfff",
+                            padding:"2px 8px",borderRadius:"10px",cursor:"pointer",fontSize:"9px",
+                            fontFamily:"inherit",whiteSpace:"nowrap"}}>
+                            {prettyCallsign(f.callsign)} · {prettyAirport(f.from)} → {prettyAirport(f.to)} · {date}
+                          </button>
+                        );
+                      })}
+                      <button onClick={() => { setRecentFlights([]); lsSet(LS_RECENT_FLIGHTS, []); }}
+                        style={{background:"transparent",border:"none",color:"#4a6a8a",cursor:"pointer",
+                          fontSize:"9px",textDecoration:"underline"}}>
+                        clear
+                      </button>
+                    </div>
+                  )}
+
                   {/* Error display */}
                   {realFlightError && (
                     <div style={{marginTop:"6px",color:"#ff6b35",fontSize:"10px",
@@ -5103,45 +5336,105 @@ export default function O3bSimulator() {
                     </div>
                   )}
 
-                  {/* Search results list */}
-                  {realFlightMode && Array.isArray(realFlightResults) && realFlightResults.length > 0 && !realFlightTrack && (
-                    <div style={{marginTop:"8px",background:"#080f1a",border:"1px solid #2e4270",borderRadius:"3px",
-                      maxHeight:"180px",overflowY:"auto"}}>
-                      <div style={{position:"sticky",top:0,background:"#0d1a2a",padding:"4px 8px",
-                        borderBottom:"1px solid #2e4270",color:"#4a6a8a",fontSize:"9px",letterSpacing:"0.05em"}}>
-                        {realFlightResults.length} FLIGHTS — click to load actual track
+                  {/* (A,C) Search results list with filter and friendly labels */}
+                  {realFlightMode && Array.isArray(realFlightResults) && realFlightResults.length > 0 && !realFlightTrack && (() => {
+                    const q = resultsFilter.trim().toLowerCase();
+                    // Filter by callsign / airline name / departure airport / arrival airport / arrival city
+                    const filtered = q ? realFlightResults.filter(f => {
+                      const cs   = (f.callsign || "").toLowerCase();
+                      const pcs  = prettyCallsign(f.callsign).toLowerCase();
+                      const dep  = (f.estDepartureAirport || "").toLowerCase();
+                      const arr  = (f.estArrivalAirport   || "").toLowerCase();
+                      const depC = prettyAirport(f.estDepartureAirport).toLowerCase();
+                      const arrC = prettyAirport(f.estArrivalAirport).toLowerCase();
+                      return cs.includes(q) || pcs.includes(q) || dep.includes(q) || arr.includes(q) || depC.includes(q) || arrC.includes(q);
+                    }) : realFlightResults;
+                    return (
+                      <div style={{marginTop:"8px",background:"#080f1a",border:"1px solid #2e4270",borderRadius:"3px"}}>
+                        {/* Filter input row */}
+                        <div style={{position:"sticky",top:0,background:"#0d1a2a",padding:"6px 8px",
+                          borderBottom:"1px solid #2e4270",display:"flex",alignItems:"center",gap:"8px",flexWrap:"wrap"}}>
+                          <span style={{color:"#4a6a8a",fontSize:"9px",letterSpacing:"0.05em",whiteSpace:"nowrap"}}>
+                            {filtered.length} of {realFlightResults.length} FLIGHTS
+                          </span>
+                          <input
+                            type="text"
+                            value={resultsFilter}
+                            onChange={e => setResultsFilter(e.target.value)}
+                            placeholder="filter: airline, dest, route…"
+                            style={{...S.sel, fontSize:"10px", flex:1, minWidth:"160px"}}
+                          />
+                          {resultsFilter && (
+                            <button onClick={() => setResultsFilter("")}
+                              style={{background:"transparent",border:"1px solid #2e4270",color:"#4a6a8a",
+                                padding:"2px 8px",borderRadius:"3px",cursor:"pointer",fontSize:"9px"}}>
+                              ✕ clear
+                            </button>
+                          )}
+                        </div>
+                        <div style={{maxHeight:"220px",overflowY:"auto"}}>
+                          {filtered.length === 0 && (
+                            <div style={{padding:"12px",color:"#4a6a8a",fontSize:"10px",textAlign:"center"}}>
+                              No flights match "{resultsFilter}". Try a different airline (e.g. AAL, BAW), city, or ICAO code.
+                            </div>
+                          )}
+                          {filtered.slice(0, 200).map((f, i) => {
+                            const callsign = (f.callsign || "").trim();
+                            const friendly = prettyCallsign(callsign);
+                            const isFriendly = friendly !== callsign && friendly !== "—";
+                            const depTime = new Date(f.firstSeen * 1000).toISOString().slice(11, 16);
+                            const fromCity = prettyAirport(f.estDepartureAirport);
+                            const toCity   = prettyAirport(f.estArrivalAirport);
+                            return (
+                              <div key={`${f.icao24}-${i}`} onClick={() => loadRealFlightTrack(f)}
+                                style={{padding:"6px 10px",cursor:"pointer",fontSize:"10px",
+                                  borderBottom:"1px solid #152030",
+                                  display:"grid",gridTemplateColumns:"140px 1fr 60px",gap:"8px",alignItems:"center",
+                                  color:"#8ab0d0"}}
+                                onMouseEnter={e => e.currentTarget.style.background = "#0d1a2a"}
+                                onMouseLeave={e => e.currentTarget.style.background = "transparent"}>
+                                {/* Callsign + friendly airline */}
+                                <div style={{lineHeight:"1.2"}}>
+                                  <div style={{color:"#00cfff",fontWeight:"bold",fontSize:"11px"}}>{callsign || "—"}</div>
+                                  {isFriendly && <div style={{color:"#5a7a9a",fontSize:"9px"}}>{friendly}</div>}
+                                </div>
+                                {/* Route with friendly cities */}
+                                <div style={{lineHeight:"1.2"}}>
+                                  <div>
+                                    <span style={{color:"#7fff00"}}>{fromCity}</span>
+                                    <span style={{color:"#4a6a8a"}}> → </span>
+                                    <span style={{color:"#ff6b35"}}>{toCity}</span>
+                                  </div>
+                                  <div style={{color:"#5a7a9a",fontSize:"9px"}}>
+                                    {f.estDepartureAirport} → {f.estArrivalAirport} · {f.icao24}
+                                  </div>
+                                </div>
+                                {/* Departure time */}
+                                <div style={{textAlign:"right",color:"#8ab0d0",fontSize:"10px",fontFamily:"inherit"}}>
+                                  {depTime}Z
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
                       </div>
-                      {realFlightResults.slice(0, 100).map((f, i)=>{
-                        const callsign = (f.callsign||"").trim();
-                        const dep = new Date(f.firstSeen*1000).toISOString().slice(11,16);
-                        return (
-                          <div key={`${f.icao24}-${i}`} onClick={()=>loadRealFlightTrack(f)}
-                            style={{padding:"4px 8px",cursor:"pointer",fontSize:"10px",
-                              borderBottom:"1px solid #152030",display:"grid",
-                              gridTemplateColumns:"80px 1fr 80px 50px",gap:"6px",alignItems:"center",
-                              color:"#8ab0d0"}}>
-                            <span style={{color:"#00cfff",fontWeight:"bold"}}>{callsign||"—"}</span>
-                            <span>
-                              <span style={{color:"#7fff00"}}>{f.estDepartureAirport}</span>
-                              <span style={{color:"#4a6a8a"}}> → </span>
-                              <span style={{color:"#ff6b35"}}>{f.estArrivalAirport}</span>
-                            </span>
-                            <span style={{color:"#4a6a8a"}}>{dep}Z</span>
-                            <span style={{color:"#4a6a8a",fontSize:"9px"}}>{f.icao24}</span>
-                          </div>
-                        );
-                      })}
-                    </div>
-                  )}
+                    );
+                  })()}
 
                   {/* Loaded track summary */}
                   {realFlightTrack && (
                     <div style={{marginTop:"8px",background:"#0d1a2a",border:"1px solid #00cfff44",borderRadius:"3px",padding:"6px 10px"}}>
                       <div style={{display:"flex",gap:"12px",flexWrap:"wrap",alignItems:"center",fontSize:"10px"}}>
                         <span style={{color:"#00cfff",fontWeight:"bold"}}>🛰 {realFlightTrack.info.callsign}</span>
-                        <span style={{color:"#7fff00"}}>{realFlightTrack.info.origin}</span>
+                        {prettyCallsign(realFlightTrack.info.callsign) !== realFlightTrack.info.callsign && (
+                          <span style={{color:"#5a7a9a",fontSize:"10px"}}>({prettyCallsign(realFlightTrack.info.callsign)})</span>
+                        )}
+                        <span style={{color:"#7fff00"}}>{prettyAirport(realFlightTrack.info.origin)}</span>
                         <span style={{color:"#4a6a8a"}}>→</span>
-                        <span style={{color:"#ff6b35"}}>{realFlightTrack.info.dest}</span>
+                        <span style={{color:"#ff6b35"}}>{prettyAirport(realFlightTrack.info.dest)}</span>
+                        <span style={{color:"#5a7a9a",fontSize:"9px"}}>
+                          {realFlightTrack.info.origin} → {realFlightTrack.info.dest}
+                        </span>
                         <span style={{color:"#8ab0d0"}}>{realFlightTrack.points.length} pts</span>
                         <span style={{color:"#8ab0d0"}}>real {(realFlightTrack.duration/3600).toFixed(1)}h</span>
                         <span style={{color:"#4a6a8a",fontSize:"9px"}}>
