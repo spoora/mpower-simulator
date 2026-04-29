@@ -8,7 +8,7 @@ import {
 // ═══════════════════════════════════════════════════════════════
 // ORBITAL CONSTANTS — O3b mPOWER
 // ═══════════════════════════════════════════════════════════════
-const VERSION = "v4.7.0";
+const VERSION = "v4.7.1";
 const Re     = 6371;
 const h_orb  = 8063;
 const Rs     = Re + h_orb;
@@ -3755,8 +3755,8 @@ export default function O3bSimulator() {
       const progress = Math.min(1, Math.max(0, elapsed / durationSec));
       const pos = interpRealTrack(realFlightTrack, progress);
       const bearing = realTrackBearing(realFlightTrack, progress);
-      // Build route polyline from track points
-      const route = realFlightTrack.points.map(p => ({ lat: p.lat, lon: p.lon }));
+      // Build route polyline from track points (same [lon, lat] tuple shape as gcRoute)
+      const route = realFlightTrack.points.map(p => [p.lon, p.lat]);
       return {
         pos, bearing, progress, dist, durationSec,
         elapsed, route,
