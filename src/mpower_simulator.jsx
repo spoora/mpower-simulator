@@ -8,7 +8,7 @@ import {
 // ═══════════════════════════════════════════════════════════════
 // ORBITAL CONSTANTS — O3b mPOWER
 // ═══════════════════════════════════════════════════════════════
-const VERSION = "v4.6.2";
+const VERSION = "v4.7.0";
 const Re     = 6371;
 const h_orb  = 8063;
 const Rs     = Re + h_orb;
@@ -430,6 +430,97 @@ const contourWidth   = el => el === 5 ? 2.2 : el % 10 === 0 ? 1.5 : 0.8;
 // ═══════════════════════════════════════════════════════════════
 const FLIGHT_SPEED_KMH = 850; // typical cruise speed
 const FLIGHT_SPEED_KMS = FLIGHT_SPEED_KMH / 3600; // km per second
+
+// OpenSky proxy (CORS-enabled, OAuth handled server-side)
+const OPENSKY_PROXY = "https://opensky.spoormaker.io";
+// Common airports (IATA / ICAO / city / lat / lon) for autocomplete in real-flight search
+// Subset of the larger airport database — covers major hubs across all regions
+const REAL_FLIGHT_AIRPORTS = [
+  {icao:"KJFK",iata:"JFK",city:"New York JFK",lat:40.6413,lon:-73.7781},
+  {icao:"KEWR",iata:"EWR",city:"Newark Liberty",lat:40.6925,lon:-74.1687},
+  {icao:"KLGA",iata:"LGA",city:"New York LaGuardia",lat:40.7769,lon:-73.8740},
+  {icao:"KBOS",iata:"BOS",city:"Boston Logan",lat:42.3656,lon:-71.0096},
+  {icao:"KIAD",iata:"IAD",city:"Washington Dulles",lat:38.9531,lon:-77.4565},
+  {icao:"KDCA",iata:"DCA",city:"Washington Reagan",lat:38.8521,lon:-77.0377},
+  {icao:"KATL",iata:"ATL",city:"Atlanta",lat:33.6407,lon:-84.4277},
+  {icao:"KMIA",iata:"MIA",city:"Miami",lat:25.7959,lon:-80.2870},
+  {icao:"KMCO",iata:"MCO",city:"Orlando",lat:28.4312,lon:-81.3081},
+  {icao:"KFLL",iata:"FLL",city:"Fort Lauderdale",lat:26.0742,lon:-80.1506},
+  {icao:"KORD",iata:"ORD",city:"Chicago O'Hare",lat:41.9742,lon:-87.9073},
+  {icao:"KDFW",iata:"DFW",city:"Dallas/Fort Worth",lat:32.8998,lon:-97.0403},
+  {icao:"KIAH",iata:"IAH",city:"Houston Intercontinental",lat:29.9844,lon:-95.3414},
+  {icao:"KDEN",iata:"DEN",city:"Denver",lat:39.8561,lon:-104.6737},
+  {icao:"KLAX",iata:"LAX",city:"Los Angeles",lat:33.9416,lon:-118.4085},
+  {icao:"KSFO",iata:"SFO",city:"San Francisco",lat:37.6213,lon:-122.3790},
+  {icao:"KSEA",iata:"SEA",city:"Seattle-Tacoma",lat:47.4502,lon:-122.3088},
+  {icao:"KLAS",iata:"LAS",city:"Las Vegas",lat:36.0840,lon:-115.1537},
+  {icao:"KPHX",iata:"PHX",city:"Phoenix",lat:33.4373,lon:-112.0078},
+  {icao:"KSAN",iata:"SAN",city:"San Diego",lat:32.7338,lon:-117.1933},
+  {icao:"CYYZ",iata:"YYZ",city:"Toronto Pearson",lat:43.6777,lon:-79.6248},
+  {icao:"CYVR",iata:"YVR",city:"Vancouver",lat:49.1967,lon:-123.1815},
+  {icao:"CYUL",iata:"YUL",city:"Montreal",lat:45.4706,lon:-73.7408},
+  {icao:"MMMX",iata:"MEX",city:"Mexico City",lat:19.4361,lon:-99.0719},
+  {icao:"MMUN",iata:"CUN",city:"Cancun",lat:21.0364,lon:-86.8770},
+  {icao:"SBGR",iata:"GRU",city:"Sao Paulo Guarulhos",lat:-23.4356,lon:-46.4731},
+  {icao:"SAEZ",iata:"EZE",city:"Buenos Aires Ezeiza",lat:-34.8222,lon:-58.5358},
+  {icao:"SCEL",iata:"SCL",city:"Santiago Chile",lat:-33.3928,lon:-70.7858},
+  {icao:"SPJC",iata:"LIM",city:"Lima",lat:-12.0219,lon:-77.1143},
+  {icao:"EGLL",iata:"LHR",city:"London Heathrow",lat:51.4700,lon:-0.4543},
+  {icao:"EGKK",iata:"LGW",city:"London Gatwick",lat:51.1481,lon:-0.1903},
+  {icao:"EGLC",iata:"LCY",city:"London City",lat:51.5053,lon:0.0553},
+  {icao:"EGCC",iata:"MAN",city:"Manchester",lat:53.3537,lon:-2.2750},
+  {icao:"EIDW",iata:"DUB",city:"Dublin",lat:53.4213,lon:-6.2701},
+  {icao:"LFPG",iata:"CDG",city:"Paris Charles de Gaulle",lat:49.0097,lon:2.5479},
+  {icao:"LFPO",iata:"ORY",city:"Paris Orly",lat:48.7233,lon:2.3794},
+  {icao:"EDDF",iata:"FRA",city:"Frankfurt",lat:50.0379,lon:8.5622},
+  {icao:"EDDM",iata:"MUC",city:"Munich",lat:48.3537,lon:11.7750},
+  {icao:"EDDB",iata:"BER",city:"Berlin Brandenburg",lat:52.3667,lon:13.5033},
+  {icao:"EHAM",iata:"AMS",city:"Amsterdam Schiphol",lat:52.3086,lon:4.7639},
+  {icao:"EBBR",iata:"BRU",city:"Brussels",lat:50.9014,lon:4.4844},
+  {icao:"LSZH",iata:"ZRH",city:"Zurich",lat:47.4647,lon:8.5492},
+  {icao:"LSGG",iata:"GVA",city:"Geneva",lat:46.2381,lon:6.1090},
+  {icao:"LIRF",iata:"FCO",city:"Rome Fiumicino",lat:41.8003,lon:12.2389},
+  {icao:"LIMC",iata:"MXP",city:"Milan Malpensa",lat:45.6306,lon:8.7281},
+  {icao:"LEMD",iata:"MAD",city:"Madrid Barajas",lat:40.4719,lon:-3.5626},
+  {icao:"LEBL",iata:"BCN",city:"Barcelona",lat:41.2974,lon:2.0833},
+  {icao:"LPPT",iata:"LIS",city:"Lisbon",lat:38.7813,lon:-9.1359},
+  {icao:"LGAV",iata:"ATH",city:"Athens",lat:37.9364,lon:23.9445},
+  {icao:"EKCH",iata:"CPH",city:"Copenhagen",lat:55.6181,lon:12.6561},
+  {icao:"ESSA",iata:"ARN",city:"Stockholm Arlanda",lat:59.6519,lon:17.9186},
+  {icao:"ENGM",iata:"OSL",city:"Oslo",lat:60.1939,lon:11.1004},
+  {icao:"EFHK",iata:"HEL",city:"Helsinki",lat:60.3172,lon:24.9633},
+  {icao:"UUEE",iata:"SVO",city:"Moscow Sheremetyevo",lat:55.9728,lon:37.4147},
+  {icao:"OMDB",iata:"DXB",city:"Dubai",lat:25.2532,lon:55.3657},
+  {icao:"OMAA",iata:"AUH",city:"Abu Dhabi",lat:24.4330,lon:54.6511},
+  {icao:"OTHH",iata:"DOH",city:"Doha",lat:25.2731,lon:51.6080},
+  {icao:"OEJN",iata:"JED",city:"Jeddah",lat:21.6796,lon:39.1565},
+  {icao:"OERK",iata:"RUH",city:"Riyadh",lat:24.9576,lon:46.6988},
+  {icao:"LTBA",iata:"IST",city:"Istanbul",lat:41.2753,lon:28.7519},
+  {icao:"LLBG",iata:"TLV",city:"Tel Aviv",lat:32.0114,lon:34.8867},
+  {icao:"HECA",iata:"CAI",city:"Cairo",lat:30.1219,lon:31.4056},
+  {icao:"FAOR",iata:"JNB",city:"Johannesburg",lat:-26.1392,lon:28.2460},
+  {icao:"FACT",iata:"CPT",city:"Cape Town",lat:-33.9648,lon:18.6017},
+  {icao:"HKJK",iata:"NBO",city:"Nairobi",lat:-1.3192,lon:36.9278},
+  {icao:"VIDP",iata:"DEL",city:"Delhi",lat:28.5562,lon:77.1000},
+  {icao:"VABB",iata:"BOM",city:"Mumbai",lat:19.0887,lon:72.8679},
+  {icao:"VOMM",iata:"MAA",city:"Chennai",lat:12.9941,lon:80.1709},
+  {icao:"VHHH",iata:"HKG",city:"Hong Kong",lat:22.3080,lon:113.9185},
+  {icao:"ZBAA",iata:"PEK",city:"Beijing Capital",lat:40.0801,lon:116.5846},
+  {icao:"ZSPD",iata:"PVG",city:"Shanghai Pudong",lat:31.1443,lon:121.8083},
+  {icao:"RJTT",iata:"HND",city:"Tokyo Haneda",lat:35.5494,lon:139.7798},
+  {icao:"RJAA",iata:"NRT",city:"Tokyo Narita",lat:35.7720,lon:140.3929},
+  {icao:"RKSI",iata:"ICN",city:"Seoul Incheon",lat:37.4602,lon:126.4407},
+  {icao:"WSSS",iata:"SIN",city:"Singapore Changi",lat:1.3644,lon:103.9915},
+  {icao:"WMKK",iata:"KUL",city:"Kuala Lumpur",lat:2.7456,lon:101.7099},
+  {icao:"VTBS",iata:"BKK",city:"Bangkok Suvarnabhumi",lat:13.6900,lon:100.7501},
+  {icao:"WIII",iata:"CGK",city:"Jakarta Soekarno-Hatta",lat:-6.1256,lon:106.6559},
+  {icao:"RPLL",iata:"MNL",city:"Manila",lat:14.5086,lon:121.0194},
+  {icao:"YSSY",iata:"SYD",city:"Sydney",lat:-33.9399,lon:151.1753},
+  {icao:"YMML",iata:"MEL",city:"Melbourne",lat:-37.6690,lon:144.8410},
+  {icao:"YBBN",iata:"BNE",city:"Brisbane",lat:-27.3942,lon:153.1218},
+  {icao:"YPPH",iata:"PER",city:"Perth",lat:-31.9402,lon:115.9669},
+  {icao:"NZAA",iata:"AKL",city:"Auckland",lat:-37.0082,lon:174.7917},
+];
 
 // Great circle distance in km between two lat/lon points
 function gcDist(lat1, lon1, lat2, lon2) {
@@ -3410,6 +3501,17 @@ export default function O3bSimulator() {
   const [flightOrigin, setFlightOrigin] = useState(null);    // {name, lat, lon}
   const [flightDest,   setFlightDest]   = useState(null);    // {name, lat, lon}
   const [flightStartTime, setFlightStartTime] = useState(null); // simTime when flight started
+  // ── Real Flight (OpenSky) state ──────────────────────────
+  const [realFlightMode,    setRealFlightMode]    = useState(false);
+  const [realFlightSearch,  setRealFlightSearch]  = useState({ airport:"", date:"" });
+  const [realFlightResults, setRealFlightResults] = useState(null); // null | array | "loading" | "error:..."
+  const [realFlightSelected, setRealFlightSelected] = useState(null); // selected flight metadata
+  const [realFlightTrack,   setRealFlightTrack]   = useState(null);   // {points:[{t,lat,lon,alt}], duration, info}
+  const [realFlightLoading, setRealFlightLoading] = useState(false);
+  const [realFlightError,   setRealFlightError]   = useState(null);
+  const [aptQReal,          setAptQReal]          = useState("");
+  const [aptOpenReal,       setAptOpenReal]       = useState(false);
+  const aptRefReal = useRef(null);
   const [flightSelecting, setFlightSelecting_] = useState(null); // "origin" | "dest" | null
   // Wrapper keeps the ref in sync for the onPinDrop closure
   function setFlightSelecting(v) { flightSelectingRef.current = v; setFlightSelecting_(v); }
@@ -3484,12 +3586,190 @@ export default function O3bSimulator() {
     return () => { if (animRef.current) cancelAnimationFrame(animRef.current); };
   }, [playing, speed]);
 
+  // ── OpenSky API helpers ────────────────────────────────────
+  // Search flights departing from an airport on a given date
+  async function searchRealFlights(icao, dateStr) {
+    setRealFlightLoading(true);
+    setRealFlightError(null);
+    setRealFlightResults("loading");
+    try {
+      // dateStr is YYYY-MM-DD; build [00:00, 24:00) UTC window
+      const startMs = Date.parse(dateStr + "T00:00:00Z");
+      if (isNaN(startMs)) throw new Error("Invalid date");
+      const begin = Math.floor(startMs / 1000);
+      const end   = begin + 86400;
+      const url = `${OPENSKY_PROXY}/api/flights/departure?airport=${encodeURIComponent(icao)}&begin=${begin}&end=${end}`;
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const text = await res.text();
+      let data;
+      try { data = JSON.parse(text); } catch { throw new Error("Invalid JSON response"); }
+      if (!Array.isArray(data)) {
+        if (data && typeof data === "object" && data.error) throw new Error(data.error);
+        throw new Error("Unexpected response format");
+      }
+      // Filter out flights without arrival airport (incomplete/cancelled)
+      const filtered = data.filter(f => f.estArrivalAirport && f.callsign);
+      // Sort by departure time
+      filtered.sort((a, b) => a.firstSeen - b.firstSeen);
+      setRealFlightResults(filtered);
+    } catch (err) {
+      setRealFlightError(`Search failed: ${err.message}`);
+      setRealFlightResults("error:" + err.message);
+    } finally {
+      setRealFlightLoading(false);
+    }
+  }
+
+  // Fetch the actual ADS-B track for a selected flight, downsample to ~200 pts,
+  // and bind origin/dest from the airport database.
+  async function loadRealFlightTrack(flight) {
+    setRealFlightLoading(true);
+    setRealFlightError(null);
+    try {
+      // Use middle-of-flight time for the tracks call
+      const midTime = Math.floor((flight.firstSeen + flight.lastSeen) / 2);
+      const url = `${OPENSKY_PROXY}/api/tracks/all?icao24=${encodeURIComponent(flight.icao24)}&time=${midTime}`;
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const text = await res.text();
+      let data;
+      try { data = JSON.parse(text); } catch { throw new Error("Invalid JSON track response"); }
+      if (!data || !Array.isArray(data.path) || data.path.length < 2) {
+        throw new Error("No track data available for this flight");
+      }
+      // path entries: [time, lat, lon, baroAlt, trueTrack, onGround]
+      const rawPts = data.path
+        .filter(p => p && p[1] !== null && p[2] !== null)
+        .map(p => ({ t: p[0], lat: p[1], lon: p[2], alt: p[3] }));
+      if (rawPts.length < 2) throw new Error("Track has fewer than 2 valid points");
+      // Normalize times to start at 0
+      const t0 = rawPts[0].t;
+      const lastT = rawPts[rawPts.length - 1].t;
+      const duration = lastT - t0;
+      if (duration <= 0) throw new Error("Track has zero duration");
+      const normalized = rawPts.map(p => ({ t: p.t - t0, lat: p.lat, lon: p.lon, alt: p.alt }));
+      // Downsample evenly to max 200 points
+      const TARGET = 200;
+      let points;
+      if (normalized.length <= TARGET) {
+        points = normalized;
+      } else {
+        const step = (normalized.length - 1) / (TARGET - 1);
+        points = [];
+        for (let i = 0; i < TARGET; i++) {
+          const idx = Math.round(i * step);
+          points.push(normalized[Math.min(idx, normalized.length - 1)]);
+        }
+      }
+      // Look up origin/dest airports
+      const origAirport = REAL_FLIGHT_AIRPORTS.find(a => a.icao === flight.estDepartureAirport);
+      const destAirport = REAL_FLIGHT_AIRPORTS.find(a => a.icao === flight.estArrivalAirport);
+      // Use first/last track point as fallback if airport unknown
+      const orig = origAirport
+        ? { iata: origAirport.iata, name: origAirport.city, city: origAirport.city, lat: origAirport.lat, lon: origAirport.lon }
+        : { iata: flight.estDepartureAirport || "ORIG", name: flight.estDepartureAirport || "Origin", city: "", lat: points[0].lat, lon: points[0].lon };
+      const dest = destAirport
+        ? { iata: destAirport.iata, name: destAirport.city, city: destAirport.city, lat: destAirport.lat, lon: destAirport.lon }
+        : { iata: flight.estArrivalAirport || "DEST", name: flight.estArrivalAirport || "Destination", city: "", lat: points[points.length-1].lat, lon: points[points.length-1].lon };
+      const track = {
+        points, duration,
+        info: {
+          callsign: flight.callsign?.trim() || "Unknown",
+          icao24: flight.icao24,
+          origin: flight.estDepartureAirport,
+          dest: flight.estArrivalAirport,
+          firstSeen: flight.firstSeen,
+          lastSeen: flight.lastSeen,
+        },
+      };
+      setRealFlightTrack(track);
+      setRealFlightSelected(flight);
+      setFlightOrigin(orig);
+      setFlightDest(dest);
+    } catch (err) {
+      setRealFlightError(`Track load failed: ${err.message}`);
+    } finally {
+      setRealFlightLoading(false);
+    }
+  }
+
+  // Clear real-flight selection (revert to great-circle mode)
+  function clearRealFlight() {
+    setRealFlightTrack(null);
+    setRealFlightSelected(null);
+    setRealFlightResults(null);
+    setRealFlightError(null);
+    setFlightOrigin(null);
+    setFlightDest(null);
+    setFlightStartTime(null);
+  }
+
+  // ── Real-flight track helpers ──────────────────────────────
+  // Interpolate position along real ADS-B track at fractional progress 0..1.
+  // Track points are {t (sec since track start), lat, lon, alt}.
+  function interpRealTrack(track, progress) {
+    const pts = track.points;
+    if (pts.length === 0) return { lat: 0, lon: 0, alt: 0 };
+    if (progress <= 0) return { lat: pts[0].lat, lon: pts[0].lon, alt: pts[0].alt || 0 };
+    if (progress >= 1) {
+      const last = pts[pts.length - 1];
+      return { lat: last.lat, lon: last.lon, alt: last.alt || 0 };
+    }
+    const targetT = progress * track.duration;
+    // Binary search for surrounding points
+    let lo = 0, hi = pts.length - 1;
+    while (hi - lo > 1) {
+      const mid = (lo + hi) >> 1;
+      if (pts[mid].t <= targetT) lo = mid; else hi = mid;
+    }
+    const a = pts[lo], b = pts[hi];
+    const span = b.t - a.t;
+    const f = span > 0 ? (targetT - a.t) / span : 0;
+    // Linear interp on lat/lon (handles longitude wrap if both points cross +/-180)
+    let dLon = b.lon - a.lon;
+    if (dLon > 180) dLon -= 360;
+    if (dLon < -180) dLon += 360;
+    return {
+      lat: a.lat + (b.lat - a.lat) * f,
+      lon: wrapL(a.lon + dLon * f),
+      alt: (a.alt || 0) + ((b.alt || 0) - (a.alt || 0)) * f,
+    };
+  }
+  // Bearing between two consecutive interpolated points
+  function realTrackBearing(track, progress) {
+    const eps = 0.001;
+    const p0 = interpRealTrack(track, Math.max(0, progress - eps));
+    const p1 = interpRealTrack(track, Math.min(1, progress + eps));
+    return gcBearing(p0.lat, p0.lon, p1.lat, p1.lon);
+  }
+
   // Flight position computation
   const flightData = useMemo(() => {
     if (!flightMode || !flightOrigin || !flightDest || flightStartTime === null) return null;
+    const elapsed = simTime - flightStartTime;
+    // If a real flight track is loaded, follow it instead of great-circle
+    if (realFlightTrack && realFlightTrack.points && realFlightTrack.points.length >= 2) {
+      const dist = gcDist(flightOrigin.lat, flightOrigin.lon, flightDest.lat, flightDest.lon);
+      const durationSec = dist / FLIGHT_SPEED_KMS;  // playback duration uses sim speed (option B)
+      const progress = Math.min(1, Math.max(0, elapsed / durationSec));
+      const pos = interpRealTrack(realFlightTrack, progress);
+      const bearing = realTrackBearing(realFlightTrack, progress);
+      // Build route polyline from track points
+      const route = realFlightTrack.points.map(p => ({ lat: p.lat, lon: p.lon }));
+      return {
+        pos, bearing, progress, dist, durationSec,
+        elapsed, route,
+        origin: flightOrigin, dest: flightDest,
+        etaMin: Math.max(0, (durationSec - elapsed) / 60),
+        complete: progress >= 1,
+        isReal: true,
+        callsign: realFlightTrack.info?.callsign,
+      };
+    }
+    // Default great-circle path
     const dist = gcDist(flightOrigin.lat, flightOrigin.lon, flightDest.lat, flightDest.lon);
     const durationSec = dist / FLIGHT_SPEED_KMS;
-    const elapsed = simTime - flightStartTime;
     const progress = Math.min(1, Math.max(0, elapsed / durationSec));
     const pos = gcInterp(flightOrigin.lat, flightOrigin.lon, flightDest.lat, flightDest.lon, progress);
     const bearing = progress < 1
@@ -3502,8 +3782,9 @@ export default function O3bSimulator() {
       origin: flightOrigin, dest: flightDest,
       etaMin: Math.max(0, (durationSec - elapsed) / 60),
       complete: progress >= 1,
+      isReal: false,
     };
-  }, [flightMode, flightOrigin, flightDest, flightStartTime, simTime]);
+  }, [flightMode, flightOrigin, flightDest, flightStartTime, simTime, realFlightTrack]);
 
   // When flight is active, update analysis point to track the plane
   useEffect(() => {
@@ -3546,7 +3827,9 @@ export default function O3bSimulator() {
     for (let i = 0; i <= N; i++) {
       const f      = i / N;
       const t      = flightStartTime + f * durationSec;
-      const pos    = gcInterp(flightOrigin.lat, flightOrigin.lon, flightDest.lat, flightDest.lon, f);
+      const pos    = (realFlightTrack && realFlightTrack.points && realFlightTrack.points.length >= 2)
+        ? interpRealTrack(realFlightTrack, f)
+        : gcInterp(flightOrigin.lat, flightOrigin.lon, flightDest.lat, flightDest.lon, f);
       const tHours = +(f * durationSec / 3600).toFixed(2);
 
       // ── Collect all satellite elevations (sorted descending) ──
@@ -3747,7 +4030,7 @@ export default function O3bSimulator() {
       numSats,
       activeGwCount: activeGateways.length,
     };
-  }, [tab, flightMode, flightOrigin, flightDest, flightStartTime, simTime, numSats, activeGateways, gwMinEl, ka2517MinEl]);
+  }, [tab, flightMode, flightOrigin, flightDest, flightStartTime, simTime, numSats, activeGateways, gwMinEl, ka2517MinEl, realFlightTrack]);
 
   // Resource chart data — precomputed 400-sample sweep for Tab 6 chart + pairing table
   const resourceData = useMemo(() => {
@@ -3766,7 +4049,9 @@ export default function O3bSimulator() {
     for (let i = 0; i <= N; i++) {
       const f = i / N;
       const t = flightStartTime + f * durationSec;
-      const pos = gcInterp(flightOrigin.lat, flightOrigin.lon, flightDest.lat, flightDest.lon, f);
+      const pos = (realFlightTrack && realFlightTrack.points && realFlightTrack.points.length >= 2)
+        ? interpRealTrack(realFlightTrack, f)
+        : gcInterp(flightOrigin.lat, flightOrigin.lon, flightDest.lat, flightDest.lon, f);
       const pct = +(f * 100).toFixed(1);
 
       // Best sat with hysteresis
@@ -3862,7 +4147,7 @@ export default function O3bSimulator() {
       covPct: +((covCount / (N + 1)) * 100).toFixed(1),
       dist, durationSec, durationHours: +(durationSec / 3600).toFixed(2),
     };
-  }, [tab, flightMode, flightOrigin, flightDest, flightStartTime, numSats, fwdCirMbps, rtnCirMbps, activeGateways, gwMinEl, ka2517MinEl]);
+  }, [tab, flightMode, flightOrigin, flightDest, flightStartTime, numSats, fwdCirMbps, rtnCirMbps, activeGateways, gwMinEl, ka2517MinEl, realFlightTrack]);
 
   // TX / RX time ribbon — 200 segments across the full flight duration
   // Each segment is classified into the 9-condition table and mapped to a colour.
@@ -3915,7 +4200,9 @@ export default function O3bSimulator() {
     for (let i = 0; i < N; i++) {
       const f   = (i + 0.5) / N;
       const t   = flightStartTime + f * durationSec;
-      const pos = gcInterp(flightOrigin.lat, flightOrigin.lon, flightDest.lat, flightDest.lon, f);
+      const pos = (realFlightTrack && realFlightTrack.points && realFlightTrack.points.length >= 2)
+        ? interpRealTrack(realFlightTrack, f)
+        : gcInterp(flightOrigin.lat, flightOrigin.lon, flightDest.lat, flightDest.lon, f);
       const tHours = +(f * durationSec / 3600).toFixed(2);
 
       // ── Collect ALL satellite elevations from terminal (sorted descending) ──
@@ -4061,14 +4348,16 @@ export default function O3bSimulator() {
     }
 
     return { txGradient: toGradient(tx), rxGradient: toGradient(rx), durationSec, N, segments, switches };
-  }, [flightMode, flightOrigin, flightDest, flightStartTime, numSats, activeGateways, gwMinEl, ka2517MinEl]);
+  }, [flightMode, flightOrigin, flightDest, flightStartTime, numSats, activeGateways, gwMinEl, ka2517MinEl, realFlightTrack]);
 
   // Convert switch fractions to lat/lon dots for the canvas map
   const pathMarkers = useMemo(() => {
     if (!flightRibbon || !flightOrigin || !flightDest) return [];
     return flightRibbon.switches.map(sw => {
       const f   = sw.pct / 100;
-      const pos = gcInterp(flightOrigin.lat, flightOrigin.lon, flightDest.lat, flightDest.lon, f);
+      const pos = (realFlightTrack && realFlightTrack.points && realFlightTrack.points.length >= 2)
+        ? interpRealTrack(realFlightTrack, f)
+        : gcInterp(flightOrigin.lat, flightOrigin.lon, flightDest.lat, flightDest.lon, f);
       return { lat: pos.lat, lon: pos.lon, type: sw.type,
                fromSat: sw.fromSat, toSat: sw.toSat,
                fromGw:  sw.fromGw,  toGw:  sw.toGw };
@@ -4387,6 +4676,12 @@ export default function O3bSimulator() {
     document.addEventListener("mousedown", h, true);
     return () => document.removeEventListener("mousedown", h, true);
   }, [aptOpen2]);
+  useEffect(() => {
+    if (!aptOpenReal) return;
+    const h = e => { if (aptRefReal.current && !aptRefReal.current.contains(e.target)) setAptOpenReal(false); };
+    document.addEventListener("mousedown", h, true);
+    return () => document.removeEventListener("mousedown", h, true);
+  }, [aptOpenReal]);
 
   return (
     <div style={S.root}>
@@ -4718,6 +5013,146 @@ export default function O3bSimulator() {
                   </>
                 )}
               </div>
+
+              {/* ── Real Flight (OpenSky) toggle and search ── */}
+              {flightMode && (
+                <div style={{marginTop:"8px",paddingTop:"8px",borderTop:"1px dashed #2e4270"}}>
+                  <div style={{display:"flex",alignItems:"center",gap:"10px",flexWrap:"wrap"}}>
+                    <label style={{color:realFlightMode?"#00cfff":"#4a6a8a",fontSize:"10px",cursor:"pointer",
+                      display:"flex",alignItems:"center",gap:"4px"}}>
+                      <input type="checkbox" checked={realFlightMode}
+                        onChange={e=>{
+                          setRealFlightMode(e.target.checked);
+                          if (!e.target.checked) clearRealFlight();
+                          else { const today = new Date(); today.setUTCDate(today.getUTCDate()-1);
+                            setRealFlightSearch({ airport:"", date: today.toISOString().slice(0,10) });
+                          }
+                        }}
+                        style={{accentColor:"#00cfff",width:"12px",height:"12px",cursor:"pointer"}} />
+                      🛰 REAL FLIGHT (OpenSky)
+                    </label>
+                    {realFlightMode && (
+                      <>
+                        {/* Airport search */}
+                        <div ref={aptRefReal} style={{position:"relative"}}>
+                          <div style={{display:"flex",alignItems:"center",gap:"4px"}}>
+                            <span style={{color:"#4a6a8a",fontSize:"9px"}}>AIRPORT:</span>
+                            <input type="text" placeholder="ICAO/IATA/city…"
+                              value={realFlightSearch.airport ? realFlightSearch.airport : aptQReal}
+                              onChange={e=>{ setAptQReal(e.target.value); setAptOpenReal(true);
+                                setRealFlightSearch({ ...realFlightSearch, airport: "" }); }}
+                              onFocus={()=>setAptOpenReal(true)}
+                              style={{...S.sel,width:"160px",fontSize:"10px"}} />
+                          </div>
+                          {aptOpenReal && aptQReal.length > 0 && (
+                            <div style={{position:"absolute",top:"100%",left:0,marginTop:"2px",
+                              background:"#0d1a2a",border:"1px solid #2e4270",borderRadius:"3px",
+                              maxHeight:"200px",overflowY:"auto",zIndex:100,minWidth:"260px"}}>
+                              {REAL_FLIGHT_AIRPORTS.filter(a=>{
+                                const q = aptQReal.toLowerCase();
+                                return a.icao.toLowerCase().includes(q) || a.iata.toLowerCase().includes(q) || a.city.toLowerCase().includes(q);
+                              }).slice(0,12).map(a=>(
+                                <div key={a.icao} onClick={()=>{
+                                  setRealFlightSearch({ ...realFlightSearch, airport: a.icao });
+                                  setAptQReal(`${a.icao} – ${a.city}`); setAptOpenReal(false);
+                                }} style={{padding:"4px 8px",cursor:"pointer",fontSize:"10px",borderBottom:"1px solid #152030",color:"#8ab0d0"}}>
+                                  <span style={{color:"#00cfff",fontWeight:"bold"}}>{a.icao}</span>
+                                  <span style={{color:"#4a6a8a"}}> / {a.iata}</span> – {a.city}
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                        {/* Date picker */}
+                        <div style={{display:"flex",alignItems:"center",gap:"4px"}}>
+                          <span style={{color:"#4a6a8a",fontSize:"9px"}}>DATE:</span>
+                          <input type="date" value={realFlightSearch.date}
+                            max={new Date(Date.now()-86400000).toISOString().slice(0,10)}
+                            onChange={e=>setRealFlightSearch({ ...realFlightSearch, date: e.target.value })}
+                            style={{...S.sel,fontSize:"10px"}} />
+                        </div>
+                        {/* Search button */}
+                        <button
+                          onClick={()=>{
+                            if (!realFlightSearch.airport) { setRealFlightError("Pick an airport first"); return; }
+                            if (!realFlightSearch.date)    { setRealFlightError("Pick a date first"); return; }
+                            searchRealFlights(realFlightSearch.airport, realFlightSearch.date);
+                          }}
+                          disabled={realFlightLoading}
+                          style={{background:"#00cfff22",border:"1px solid #00cfff",color:"#00cfff",
+                            padding:"3px 12px",borderRadius:"3px",cursor:realFlightLoading?"wait":"pointer",
+                            fontSize:"10px",fontFamily:"inherit",fontWeight:"bold",opacity:realFlightLoading?0.6:1}}>
+                          {realFlightLoading ? "…" : "🔍 SEARCH"}
+                        </button>
+                        {realFlightTrack && (
+                          <button onClick={clearRealFlight}
+                            style={{background:"transparent",border:"1px solid #2e4270",color:"#4a6a8a",
+                              padding:"3px 10px",borderRadius:"3px",cursor:"pointer",fontSize:"10px"}}>
+                            ✕ CLEAR
+                          </button>
+                        )}
+                      </>
+                    )}
+                  </div>
+
+                  {/* Error display */}
+                  {realFlightError && (
+                    <div style={{marginTop:"6px",color:"#ff6b35",fontSize:"10px",
+                      background:"#ff6b3512",border:"1px solid #ff6b3544",borderRadius:"3px",padding:"4px 8px"}}>
+                      ⚠ {realFlightError}
+                    </div>
+                  )}
+
+                  {/* Search results list */}
+                  {realFlightMode && Array.isArray(realFlightResults) && realFlightResults.length > 0 && !realFlightTrack && (
+                    <div style={{marginTop:"8px",background:"#080f1a",border:"1px solid #2e4270",borderRadius:"3px",
+                      maxHeight:"180px",overflowY:"auto"}}>
+                      <div style={{position:"sticky",top:0,background:"#0d1a2a",padding:"4px 8px",
+                        borderBottom:"1px solid #2e4270",color:"#4a6a8a",fontSize:"9px",letterSpacing:"0.05em"}}>
+                        {realFlightResults.length} FLIGHTS — click to load actual track
+                      </div>
+                      {realFlightResults.slice(0, 100).map((f, i)=>{
+                        const callsign = (f.callsign||"").trim();
+                        const dep = new Date(f.firstSeen*1000).toISOString().slice(11,16);
+                        return (
+                          <div key={`${f.icao24}-${i}`} onClick={()=>loadRealFlightTrack(f)}
+                            style={{padding:"4px 8px",cursor:"pointer",fontSize:"10px",
+                              borderBottom:"1px solid #152030",display:"grid",
+                              gridTemplateColumns:"80px 1fr 80px 50px",gap:"6px",alignItems:"center",
+                              color:"#8ab0d0"}}>
+                            <span style={{color:"#00cfff",fontWeight:"bold"}}>{callsign||"—"}</span>
+                            <span>
+                              <span style={{color:"#7fff00"}}>{f.estDepartureAirport}</span>
+                              <span style={{color:"#4a6a8a"}}> → </span>
+                              <span style={{color:"#ff6b35"}}>{f.estArrivalAirport}</span>
+                            </span>
+                            <span style={{color:"#4a6a8a"}}>{dep}Z</span>
+                            <span style={{color:"#4a6a8a",fontSize:"9px"}}>{f.icao24}</span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+
+                  {/* Loaded track summary */}
+                  {realFlightTrack && (
+                    <div style={{marginTop:"8px",background:"#0d1a2a",border:"1px solid #00cfff44",borderRadius:"3px",padding:"6px 10px"}}>
+                      <div style={{display:"flex",gap:"12px",flexWrap:"wrap",alignItems:"center",fontSize:"10px"}}>
+                        <span style={{color:"#00cfff",fontWeight:"bold"}}>🛰 {realFlightTrack.info.callsign}</span>
+                        <span style={{color:"#7fff00"}}>{realFlightTrack.info.origin}</span>
+                        <span style={{color:"#4a6a8a"}}>→</span>
+                        <span style={{color:"#ff6b35"}}>{realFlightTrack.info.dest}</span>
+                        <span style={{color:"#8ab0d0"}}>{realFlightTrack.points.length} pts</span>
+                        <span style={{color:"#8ab0d0"}}>real {(realFlightTrack.duration/3600).toFixed(1)}h</span>
+                        <span style={{color:"#4a6a8a",fontSize:"9px"}}>
+                          {new Date(realFlightTrack.info.firstSeen*1000).toISOString().slice(0,16).replace("T"," ")}Z
+                        </span>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+
               {/* Flight status bar */}
               {flightData && (
                 <div style={{display:"flex",alignItems:"center",gap:"12px",marginTop:"8px",flexWrap:"wrap"}}>
