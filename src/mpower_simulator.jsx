@@ -8,7 +8,7 @@ import {
 // ═══════════════════════════════════════════════════════════════
 // ORBITAL CONSTANTS — O3b mPOWER
 // ═══════════════════════════════════════════════════════════════
-const VERSION = "v4.12.4";
+const VERSION = "v4.13.0";
 const Re     = 6371;
 const h_orb  = 8063;
 const Rs     = Re + h_orb;
@@ -858,7 +858,7 @@ function beamFootprintPolygon(termLat, termLon, satLonDeg, elDeg, beamHalfDeg, n
   return { type: "Feature", geometry: { type: "Polygon", coordinates: [pts] } };
 }
 
-function BeamProjectionTab({ simTime, numSats, satNames, gpLat, gpLon, flightActive, flightInfo, activeGateways, gwMinEl, ka2517MinEl, onRestartFlight }) {
+function BeamProjectionTab({ simTime, numSats, satNames, gpLat, gpLon, flightActive, flightInfo, activeGateways, gwMinEl, ka2517MinEl, onRestartFlight, flightStartTime, flightDurationSec, onSeek }) {
   const canvasRef  = useRef(null);
   const worldRef   = useRef(null);
   const dragRef    = useRef(null);
@@ -1463,8 +1463,60 @@ function BeamProjectionTab({ simTime, numSats, satNames, gpLat, gpLon, flightAct
   const btnStyle   = {background:"#0d1a2a",border:"1px solid #2e4270",color:"#8ab0d0",
     padding:"4px 10px",borderRadius:"3px",cursor:"pointer",fontSize:"10px",fontFamily:"inherit"};
 
+  // Local helper to format seconds as HH:MM:SS for the slider readout
+  const fmtTime = (s) => {
+    const sec = Math.max(0, Math.floor(s));
+    const h = Math.floor(sec / 3600);
+    const m = Math.floor((sec % 3600) / 60);
+    const ss = sec % 60;
+    return `${String(h).padStart(2,"0")}:${String(m).padStart(2,"0")}:${String(ss).padStart(2,"0")}`;
+  };
+
+  // Flight time relative to flightStartTime (for slider). Always 0 when no flight.
+  const flightElapsed = (flightStartTime != null) ? Math.max(0, simTime - flightStartTime) : 0;
+  const flightProgress = flightDurationSec > 0 ? Math.min(1, flightElapsed / flightDurationSec) : 0;
+
   return (
     <div style={{fontFamily:"'Courier New',monospace"}}>
+
+      {/* ── Flight timeline scrubber (only when a flight is active) ── */}
+      {flightStartTime != null && flightDurationSec > 0 && onSeek && (
+        <div style={{
+          background:"#080f1a",border:"1px solid #00ff8844",borderRadius:"4px",
+          padding:"8px 12px",marginBottom:"8px",display:"flex",alignItems:"center",gap:"10px",flexWrap:"wrap"
+        }}>
+          <span style={{color:"#00ff88",fontSize:"10px",fontWeight:"bold",letterSpacing:"0.05em"}}>
+            ✈ FLIGHT TIMELINE
+          </span>
+          <button onClick={()=>onSeek(0, /*pause=*/true)}
+            style={{...btnStyle,padding:"3px 8px",fontSize:"11px"}}
+            title="Jump to flight start (T+0)">
+            «« START
+          </button>
+          <span style={{color:"#8ab0d0",fontSize:"10px",fontFamily:"inherit",whiteSpace:"nowrap"}}>
+            T+ {fmtTime(flightElapsed)}
+          </span>
+          <input type="range" min={0} max={1000} step={1}
+            value={Math.round(flightProgress * 1000)}
+            onChange={e => {
+              const f = +e.target.value / 1000;
+              onSeek(f * flightDurationSec, /*pause=*/true);
+            }}
+            style={{flex:1, minWidth:"200px", accentColor:"#00ff88", cursor:"pointer"}}
+          />
+          <span style={{color:"#8ab0d0",fontSize:"10px",fontFamily:"inherit",whiteSpace:"nowrap"}}>
+            {fmtTime(flightDurationSec)}
+          </span>
+          <span style={{color:"#5a9a7a",fontSize:"10px",minWidth:"42px",textAlign:"right"}}>
+            {(flightProgress*100).toFixed(1)}%
+          </span>
+          <button onClick={()=>onSeek(flightDurationSec, /*pause=*/true)}
+            style={{...btnStyle,padding:"3px 8px",fontSize:"11px"}}
+            title="Jump to flight end (T+duration)">
+            END »»
+          </button>
+        </div>
+      )}
 
       <div style={{display:"flex",gap:"6px",marginBottom:"8px",alignItems:"center",flexWrap:"wrap"}}>
         <button onClick={copyImage} style={btnStyle}>Copy Image</button>
@@ -7913,6 +7965,14 @@ export default function O3bSimulator() {
               setGpLat(flightOrigin.lat); setGpLon(flightOrigin.lon);
               setPins([]); setSelectedCity(null);
               if (!playing) setPlaying(true);
+            }) : null}
+            flightStartTime={flightData ? flightStartTime : null}
+            flightDurationSec={flightData ? flightData.durationSec : 0}
+            onSeek={flightData ? ((relativeSec, pauseAfter) => {
+              const newSimTime = flightStartTime + relativeSec;
+              setSimTime(newSimTime);
+              simTimeRef.current = newSimTime;
+              if (pauseAfter) setPlaying(false);
             }) : null}
           />
         )}
