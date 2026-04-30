@@ -8,7 +8,7 @@ import {
 // ═══════════════════════════════════════════════════════════════
 // ORBITAL CONSTANTS — O3b mPOWER
 // ═══════════════════════════════════════════════════════════════
-const VERSION = "v4.10.1";
+const VERSION = "v4.11.0";
 const Re     = 6371;
 const h_orb  = 8063;
 const Rs     = Re + h_orb;
@@ -4613,6 +4613,222 @@ export default function O3bSimulator() {
     };
   }, [tab, flightMode, flightOrigin, flightDest, flightStartTime, numSats, fwdCirMbps, rtnCirMbps, activeGateways, gwMinEl, ka2517MinEl, realFlightTrack]);
 
+  // ──────────────────────────────────────────────────────────────────────
+  // Strategy comparison — three gateway/satellite handover policies, run
+  // against the same flight path. Splash-zone radius (along-track semi-axis)
+  // is the optimization metric: smaller = less satellite resource consumed.
+  //
+  //   S3 (free-pick):    optimal sat+GW pair at every step → smallest splash
+  //   S2 (single-GW):    one fixed gateway, switch sats opportunistically
+  //   S1 (single-GW + locked sat): one gateway, only switch sats when
+  //                       current sat drops out of GW LOS → largest splash
+  //
+  // The single gateway used for S1/S2 is auto-selected as the gateway that
+  // gives the BEST average S1 result over the flight (option C from spec).
+  // ──────────────────────────────────────────────────────────────────────
+  const strategyData = useMemo(() => {
+    if (tab !== "strategy" || !flightMode || !flightOrigin || !flightDest || flightStartTime === null) return null;
+    if (!activeGateways || activeGateways.length === 0) return { error: "No active gateways selected" };
+
+    const dist = gcDist(flightOrigin.lat, flightOrigin.lon, flightDest.lat, flightDest.lon);
+    const durationSec = dist / FLIGHT_SPEED_KMS;
+    const N = 200;
+    const dt_min = (durationSec / N) / 60;
+    const ka2517Min = ka2517MinEl ?? 20;
+    const gwMin     = gwMinEl ?? 10;
+    const SAT_HYS   = 2;
+    const BEAM_HALF = 0.8; // deg, same as Beam Projection default
+
+    // Pre-compute path positions and per-step satellite geometry once
+    const samples = []; // {pos, satEls:[{idx, el, satLon}]}
+    for (let i = 0; i <= N; i++) {
+      const f = i / N;
+      const t = flightStartTime + f * durationSec;
+      const pos = (realFlightTrack && realFlightTrack.points && realFlightTrack.points.length >= 2)
+        ? interpRealTrack(realFlightTrack, f)
+        : gcInterp(flightOrigin.lat, flightOrigin.lon, flightDest.lat, flightDest.lon, f);
+      const satEls = [];
+      for (let s = 0; s < numSats; s++) {
+        const sl = satLon(s, t, numSats);
+        const el = elevAngle(pos.lat, pos.lon, sl);
+        satEls.push({ idx: s, el, satLon: sl });
+      }
+      satEls.sort((a, b) => b.el - a.el);
+      samples.push({ pos, t, satEls });
+    }
+
+    // Helper: splash-zone radius (along-track semi-axis) at given EL
+    function splashKm(el) {
+      if (el < 1) return null;
+      const d = groundSlantRange(Math.max(el, 1));
+      const tanA = Math.tan(toRad(BEAM_HALF));
+      const b = d * tanA;
+      const a = b / Math.sin(toRad(Math.max(el, 1)));
+      return a;
+    }
+
+    // ── Strategy S3: free-pick (optimal sat+gw at every step) ──
+    // For each sample, find the highest-EL sat that has at least one GW with
+    // bestGwEl >= gwMin; pick that GW.
+    function runS3() {
+      const out = [];
+      let prevSat = -1, prevGw = null, satHo = 0, gwHo = 0;
+      for (const s of samples) {
+        let chosen = null;
+        for (const sat of s.satEls) {
+          if (sat.el < ka2517Min) break;
+          let bGw = null, bGwEl = -90;
+          for (const gw of activeGateways) {
+            const e = elevAngle(gw.lat, gw.lon, sat.satLon);
+            if (e > bGwEl) { bGwEl = e; bGw = gw; }
+          }
+          if (bGwEl >= gwMin && bGw) { chosen = { sat, gw: bGw, gwEl: bGwEl }; break; }
+        }
+        if (!chosen) {
+          out.push({ closed: true });
+          continue;
+        }
+        if (prevSat >= 0 && chosen.sat.idx !== prevSat) satHo++;
+        if (prevGw && chosen.gw.id !== prevGw) gwHo++;
+        prevSat = chosen.sat.idx;
+        prevGw  = chosen.gw.id;
+        out.push({ el: chosen.sat.el, splash: splashKm(chosen.sat.el), satIdx: chosen.sat.idx, gwId: chosen.gw.id, closed: false });
+      }
+      return { samples: out, satHo, gwHo };
+    }
+
+    // ── Strategy S2: single GW, opportunistic sat switching ──
+    // Lock to one gateway. Each step, pick the highest-EL sat that *this gateway*
+    // can see at >= gwMin. Use SAT_HYS to avoid jitter.
+    function runS2(gw) {
+      const out = [];
+      let prevSat = -1, satHo = 0;
+      for (const s of samples) {
+        const viable = s.satEls.filter(sat => {
+          if (sat.el < ka2517Min) return false;
+          const ge = elevAngle(gw.lat, gw.lon, sat.satLon);
+          return ge >= gwMin;
+        });
+        if (viable.length === 0) {
+          out.push({ closed: true });
+          continue;
+        }
+        // Hysteresis: keep current sat if still viable and best alt isn't >SAT_HYS better
+        let chosen = viable[0];
+        const cur = viable.find(v => v.idx === prevSat);
+        if (cur && (viable[0].el - cur.el) < SAT_HYS) chosen = cur;
+        if (prevSat >= 0 && chosen.idx !== prevSat) satHo++;
+        prevSat = chosen.idx;
+        out.push({ el: chosen.el, splash: splashKm(chosen.el), satIdx: chosen.idx, gwId: gw.id, closed: false });
+      }
+      return { samples: out, satHo, gwHo: 0 };
+    }
+
+    // ── Strategy S1: single GW, sat locked until forced switch ──
+    // Stay on current sat until it drops out of GW LOS (or terminal scan).
+    function runS1(gw) {
+      const out = [];
+      let curSat = -1, satHo = 0;
+      for (const s of samples) {
+        // Is current sat still viable through this gateway?
+        let chosen = null;
+        if (curSat >= 0) {
+          const cur = s.satEls.find(x => x.idx === curSat);
+          if (cur && cur.el >= ka2517Min) {
+            const ge = elevAngle(gw.lat, gw.lon, cur.satLon);
+            if (ge >= gwMin) chosen = cur;
+          }
+        }
+        if (!chosen) {
+          // Forced switch: pick best available
+          for (const sat of s.satEls) {
+            if (sat.el < ka2517Min) break;
+            const ge = elevAngle(gw.lat, gw.lon, sat.satLon);
+            if (ge >= gwMin) { chosen = sat; break; }
+          }
+          if (chosen) {
+            if (curSat >= 0) satHo++;
+            curSat = chosen.idx;
+          }
+        }
+        if (!chosen) {
+          out.push({ closed: true });
+          continue;
+        }
+        out.push({ el: chosen.el, splash: splashKm(chosen.el), satIdx: chosen.idx, gwId: gw.id, closed: false });
+      }
+      return { samples: out, satHo, gwHo: 0 };
+    }
+
+    // Auto-pick the best single GW for S1/S2 (option C):
+    // Score each GW by mean closed-sample splash on S1; pick the one with the lowest mean splash.
+    let bestGw = null, bestS1Score = Infinity, bestS1 = null;
+    const allS1Results = {};
+    for (const gw of activeGateways) {
+      const r = runS1(gw);
+      const closedSamples = r.samples.filter(x => !x.closed);
+      const meanSplash = closedSamples.length
+        ? closedSamples.reduce((a, x) => a + x.splash, 0) / closedSamples.length
+        : Infinity;
+      allS1Results[gw.id] = { meanSplash, openCount: closedSamples.length, run: r };
+      if (meanSplash < bestS1Score) { bestS1Score = meanSplash; bestGw = gw; bestS1 = r; }
+    }
+    if (!bestGw) return { error: "No gateway can serve any portion of this flight" };
+    const s2 = runS2(bestGw);
+    const s3 = runS3();
+
+    // Compose chart data
+    const chart = [];
+    let s1OpenSum = 0, s2OpenSum = 0, s3OpenSum = 0;
+    let s1OpenN   = 0, s2OpenN   = 0, s3OpenN   = 0;
+    let s1ClosedN = 0, s2ClosedN = 0, s3ClosedN = 0;
+    for (let i = 0; i <= N; i++) {
+      const f = i / N;
+      const pct = +(f * 100).toFixed(1);
+      const a = bestS1.samples[i];
+      const b = s2.samples[i];
+      const c = s3.samples[i];
+      const aS = a.closed ? null : a.splash;
+      const bS = b.closed ? null : b.splash;
+      const cS = c.closed ? null : c.splash;
+      // Stack increments: s3 is base, then (s2-s3) is the cost of locking GW with sat-switching,
+      // then (s1-s2) is the additional cost of locking the sat too.
+      let s3Layer = null, s2Layer = null, s1Layer = null;
+      if (cS !== null) s3Layer = cS;
+      if (bS !== null) s2Layer = (cS !== null) ? Math.max(0, bS - cS) : bS;
+      if (aS !== null) s1Layer = (bS !== null) ? Math.max(0, aS - bS) : (cS !== null ? Math.max(0, aS - cS) : aS);
+      chart.push({
+        pct,
+        s3: s3Layer, s2: s2Layer, s1: s1Layer,
+        s1Total: aS, s2Total: bS, s3Total: cS,
+        s1Closed: a.closed, s2Closed: b.closed, s3Closed: c.closed,
+      });
+      if (aS !== null) { s1OpenSum += aS; s1OpenN++; } else s1ClosedN++;
+      if (bS !== null) { s2OpenSum += bS; s2OpenN++; } else s2ClosedN++;
+      if (cS !== null) { s3OpenSum += cS; s3OpenN++; } else s3ClosedN++;
+    }
+    const tot = N + 1;
+    return {
+      chart,
+      bestGw,
+      durationHours: +(durationSec / 3600).toFixed(2),
+      // Per-strategy summary
+      s1: { meanSplash: s1OpenN ? s1OpenSum / s1OpenN : null, satHo: bestS1.satHo, gwHo: 0,
+            availPct: +(s1OpenN / tot * 100).toFixed(1) },
+      s2: { meanSplash: s2OpenN ? s2OpenSum / s2OpenN : null, satHo: s2.satHo, gwHo: 0,
+            availPct: +(s2OpenN / tot * 100).toFixed(1) },
+      s3: { meanSplash: s3OpenN ? s3OpenSum / s3OpenN : null, satHo: s3.satHo, gwHo: s3.gwHo,
+            availPct: +(s3OpenN / tot * 100).toFixed(1) },
+      // Comparison of all GWs as single-GW candidates (for context)
+      gwScores: Object.entries(allS1Results).map(([id, r]) => ({
+        id,
+        name: activeGateways.find(g => g.id === id)?.name || id,
+        meanSplash: isFinite(r.meanSplash) ? r.meanSplash : null,
+        availPct: +(r.openCount / tot * 100).toFixed(1),
+      })).sort((a, b) => (a.meanSplash || Infinity) - (b.meanSplash || Infinity)),
+    };
+  }, [tab, flightMode, flightOrigin, flightDest, flightStartTime, numSats, activeGateways, gwMinEl, ka2517MinEl, realFlightTrack]);
+
   // TX / RX time ribbon — 200 segments across the full flight duration
   // Each segment is classified into the 9-condition table and mapped to a colour.
   // TX and RX are differentiated by which link is the "worst link" in each condition.
@@ -5208,7 +5424,7 @@ export default function O3bSimulator() {
       <div style={S.tabs}>
         {[
           ["coverage","◎ COVERAGE MAP"],
-          ...(flightMode ? [["flight","✈ FLIGHT SUMMARY"],["resources","📊 RESOURCES"]] : []),
+          ...(flightMode ? [["flight","✈ FLIGHT SUMMARY"],["resources","📊 RESOURCES"],["strategy","⊞ STRATEGY"]] : []),
           ["gateways","🗂 GATEWAYS"],
           ["weather","🌩 GW WEATHER RISK"],
           ["beam","📡 BEAM PROJECTION"],
@@ -7239,6 +7455,153 @@ export default function O3bSimulator() {
                   }} style={{background:"transparent",border:"1px solid #2e4270",color:"#4a6a8a",padding:"4px 14px",borderRadius:"3px",cursor:"pointer",fontSize:"10px",fontFamily:"inherit"}}>
                     Copy Summary
                   </button>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ════ TAB — STRATEGY (single-GW vs free-pick) ════ */}
+        {tab==="strategy" && flightMode && (
+          <div>
+            {!strategyData ? (
+              <div style={{color:"#4a6a8a",textAlign:"center",padding:"40px",fontSize:"12px"}}>
+                Select origin and destination on the Coverage Map tab and press LAUNCH to compare gateway strategies.
+              </div>
+            ) : strategyData.error ? (
+              <div style={{color:"#ff6b35",textAlign:"center",padding:"40px",fontSize:"12px"}}>
+                {strategyData.error}
+              </div>
+            ) : (
+              <div>
+                {/* Header / context */}
+                <div style={{marginBottom:"10px",padding:"8px 12px",background:"#080f1a",border:"1px solid #1e3055",borderRadius:"3px"}}>
+                  <div style={{display:"flex",alignItems:"center",gap:"14px",flexWrap:"wrap",fontSize:"11px"}}>
+                    <span style={{color:"#00cfff",fontWeight:"bold",letterSpacing:"0.05em"}}>STRATEGY COMPARISON</span>
+                    <span style={{color:"#4a6a8a"}}>Best single GW for this route:</span>
+                    <span style={{color:"#ff9900",fontWeight:"bold"}}>{strategyData.bestGw.id} ({strategyData.bestGw.name})</span>
+                    <span style={{color:"#4a6a8a"}}>{strategyData.durationHours}h flight, {numSats} sats</span>
+                  </div>
+                  <div style={{color:"#5a7a9a",fontSize:"10px",marginTop:"5px",lineHeight:"1.4"}}>
+                    Splash zone radius = along-track semi-axis of the {0.8}deg beam footprint at the terminal.
+                    Smaller is better — less satellite resource consumed per closed link.
+                  </div>
+                </div>
+
+                {/* Three summary cards */}
+                <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:"8px",marginBottom:"10px"}}>
+                  {[
+                    { key:"s3", label:"S3 — FREE PICK",         color:"#00ff88", desc:"Optimal sat+GW at every step" },
+                    { key:"s2", label:"S2 — SINGLE GW",         color:"#7fff00", desc:"One GW, switch sats opportunistically" },
+                    { key:"s1", label:"S1 — SINGLE GW + LOCK",  color:"#ffd700", desc:"One GW, sat locked until forced switch" },
+                  ].map(card => {
+                    const d = strategyData[card.key];
+                    return (
+                      <div key={card.key} style={{background:"#080f1a",border:`1px solid ${card.color}44`,
+                        borderLeft:`3px solid ${card.color}`,borderRadius:"3px",padding:"10px 12px"}}>
+                        <div style={{color:card.color,fontSize:"10px",fontWeight:"bold",letterSpacing:"0.05em",marginBottom:"4px"}}>
+                          {card.label}
+                        </div>
+                        <div style={{color:"#7a9ab8",fontSize:"10px",marginBottom:"8px",lineHeight:"1.3"}}>
+                          {card.desc}
+                        </div>
+                        <div style={{display:"grid",gridTemplateColumns:"auto 1fr",gap:"3px 8px",fontSize:"11px"}}>
+                          <span style={{color:"#4a6a8a"}}>Mean splash:</span>
+                          <span style={{color:card.color,fontWeight:"bold"}}>
+                            {d.meanSplash !== null ? `${d.meanSplash.toFixed(1)} km` : "—"}
+                          </span>
+                          <span style={{color:"#4a6a8a"}}>Availability:</span>
+                          <span style={{color:"#c0d8f0"}}>{d.availPct}%</span>
+                          <span style={{color:"#4a6a8a"}}>Sat handovers:</span>
+                          <span style={{color:"#c0d8f0"}}>{d.satHo}</span>
+                          <span style={{color:"#4a6a8a"}}>GW handovers:</span>
+                          <span style={{color:"#c0d8f0"}}>{d.gwHo}</span>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+
+                {/* Stacked area chart */}
+                <div style={{color:"#4a6a8a",fontSize:"10px",marginBottom:"6px",letterSpacing:"0.05em"}}>
+                  CONTRIBUTION STACK — splash zone radius (km) along flight progress
+                </div>
+                <ResponsiveContainer width="100%" height={260}>
+                  <LineChart data={strategyData.chart} margin={{top:8,right:12,bottom:18,left:6}}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#152030"/>
+                    <XAxis dataKey="pct" stroke="#2e4270" tick={{fill:"#4a6a8a",fontSize:9}}
+                      label={{value:"Flight progress (%)",position:"insideBottom",offset:-8,fill:"#4a6a8a",fontSize:9}}/>
+                    <YAxis stroke="#2e4270" tick={{fill:"#4a6a8a",fontSize:9}}
+                      label={{value:"Splash radius (km)",angle:-90,position:"insideLeft",fill:"#4a6a8a",fontSize:9,offset:14}}/>
+                    <Tooltip contentStyle={{background:"#080f1a",border:"1px solid #2e4270",fontSize:"11px"}}
+                      labelFormatter={v=>`T+${(+v).toFixed(1)}%`}
+                      formatter={(v,k)=>{
+                        if (v === null || v === undefined) return ["—", k];
+                        return [`${(+v).toFixed(1)} km`, k];
+                      }}/>
+                    <Legend wrapperStyle={{fontSize:"10px"}}/>
+                    <Line type="monotone" dataKey="s3Total" stroke="#00ff88" strokeWidth={2} dot={false} name="S3 free-pick"/>
+                    <Line type="monotone" dataKey="s2Total" stroke="#7fff00" strokeWidth={1.5} dot={false} strokeDasharray="4 2" name="S2 single GW"/>
+                    <Line type="monotone" dataKey="s1Total" stroke="#ffd700" strokeWidth={1.5} dot={false} strokeDasharray="2 4" name="S1 single GW + lock"/>
+                  </LineChart>
+                </ResponsiveContainer>
+
+                {/* Stack area - showing increments */}
+                <div style={{color:"#4a6a8a",fontSize:"10px",marginTop:"14px",marginBottom:"6px",letterSpacing:"0.05em"}}>
+                  STRATEGY INCREMENTS — extra splash above S3 baseline
+                </div>
+                <ResponsiveContainer width="100%" height={200}>
+                  <LineChart data={strategyData.chart} margin={{top:8,right:12,bottom:18,left:6}}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#152030"/>
+                    <XAxis dataKey="pct" stroke="#2e4270" tick={{fill:"#4a6a8a",fontSize:9}}
+                      label={{value:"Flight progress (%)",position:"insideBottom",offset:-8,fill:"#4a6a8a",fontSize:9}}/>
+                    <YAxis stroke="#2e4270" tick={{fill:"#4a6a8a",fontSize:9}}
+                      label={{value:"Increment (km)",angle:-90,position:"insideLeft",fill:"#4a6a8a",fontSize:9,offset:14}}/>
+                    <Tooltip contentStyle={{background:"#080f1a",border:"1px solid #2e4270",fontSize:"11px"}}
+                      labelFormatter={v=>`T+${(+v).toFixed(1)}%`}
+                      formatter={(v,k)=>v===null||v===undefined?["—",k]:[`+${(+v).toFixed(1)} km`, k]}/>
+                    <Legend wrapperStyle={{fontSize:"10px"}}/>
+                    <Line type="monotone" dataKey="s2" stroke="#7fff00" strokeWidth={1.5} dot={false} name="S2 cost (vs S3)"/>
+                    <Line type="monotone" dataKey="s1" stroke="#ffd700" strokeWidth={1.5} dot={false} name="S1 extra cost (vs S2)"/>
+                  </LineChart>
+                </ResponsiveContainer>
+
+                {/* Per-gateway S1 score table */}
+                <div style={{color:"#4a6a8a",fontSize:"10px",marginTop:"14px",marginBottom:"6px",letterSpacing:"0.05em"}}>
+                  SINGLE-GATEWAY CANDIDATES (S1 baseline — sorted by mean splash)
+                </div>
+                <div style={{background:"#080f1a",border:"1px solid #2e4270",borderRadius:"3px",padding:"8px"}}>
+                  <div style={{display:"grid",gridTemplateColumns:"60px 1fr 100px 80px 80px",gap:"8px",
+                    padding:"3px 0",borderBottom:"1px solid #2e4270",marginBottom:"3px",
+                    color:"#4a6a8a",fontSize:"9px",letterSpacing:"0.05em"}}>
+                    <span>RANK</span><span>GATEWAY</span><span style={{textAlign:"right"}}>MEAN SPLASH</span>
+                    <span style={{textAlign:"right"}}>AVAIL</span><span style={{textAlign:"right"}}>vs BEST</span>
+                  </div>
+                  {strategyData.gwScores.map((g, i) => {
+                    const isBest = g.id === strategyData.bestGw.id;
+                    const delta = g.meanSplash !== null && strategyData.gwScores[0].meanSplash !== null
+                      ? g.meanSplash - strategyData.gwScores[0].meanSplash : null;
+                    return (
+                      <div key={g.id} style={{display:"grid",gridTemplateColumns:"60px 1fr 100px 80px 80px",gap:"8px",
+                        padding:"3px 0",borderBottom:"1px solid #152030",alignItems:"center",fontSize:"11px"}}>
+                        <span style={{color:isBest?"#ff9900":"#4a6a8a",fontWeight:isBest?"bold":"normal"}}>
+                          {isBest?"★ ":"  "}{i+1}
+                        </span>
+                        <span style={{color:isBest?"#ff9900":"#8ab0d0",fontWeight:isBest?"bold":"normal"}}>
+                          {g.id} <span style={{color:"#5a7a9a"}}>{g.name}</span>
+                        </span>
+                        <span style={{color:"#c0d8f0",textAlign:"right"}}>
+                          {g.meanSplash !== null ? `${g.meanSplash.toFixed(1)} km` : "—"}
+                        </span>
+                        <span style={{color:g.availPct >= 95 ? "#00ff88" : g.availPct >= 70 ? "#ffd700" : "#ff6b35",textAlign:"right"}}>
+                          {g.availPct}%
+                        </span>
+                        <span style={{color:"#5a7a9a",textAlign:"right",fontSize:"10px"}}>
+                          {delta === null ? "—" : delta === 0 ? "—" : `+${delta.toFixed(1)} km`}
+                        </span>
+                      </div>
+                    );
+                  })}
                 </div>
               </div>
             )}
