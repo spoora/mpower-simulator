@@ -8,7 +8,7 @@ import {
 // ═══════════════════════════════════════════════════════════════
 // ORBITAL CONSTANTS — O3b mPOWER
 // ═══════════════════════════════════════════════════════════════
-const VERSION = "v4.9.1";
+const VERSION = "v4.10.0";
 const Re     = 6371;
 const h_orb  = 8063;
 const Rs     = Re + h_orb;
@@ -858,7 +858,7 @@ function beamFootprintPolygon(termLat, termLon, satLonDeg, elDeg, beamHalfDeg, n
   return { type: "Feature", geometry: { type: "Polygon", coordinates: [pts] } };
 }
 
-function BeamProjectionTab({ simTime, numSats, satNames, gpLat, gpLon, flightActive, flightInfo }) {
+function BeamProjectionTab({ simTime, numSats, satNames, gpLat, gpLon, flightActive, flightInfo, activeGateways, gwMinEl, ka2517MinEl }) {
   const canvasRef  = useRef(null);
   const worldRef   = useRef(null);
   const dragRef    = useRef(null);
@@ -937,6 +937,64 @@ function BeamProjectionTab({ simTime, numSats, satNames, gpLat, gpLon, flightAct
     }
     return vis.sort((a, b) => b.el - a.el);
   }, [simTime, numSats, satNames, termLat, termLon, limitElev, limitElevVal]);
+
+  // ── Active link resolution: pick the satellite + gateway that close the circuit
+  // using the same gateway-aware logic as the rest of the simulator.
+  // Returns { sat, gw, satEl, gwEl, reason, fallback }.
+  const activeLink = useMemo(() => {
+    const gws = activeGateways || [];
+    const ka2517Min = ka2517MinEl ?? 20;
+    const gwMin     = gwMinEl ?? 10;
+    // Build all sats sorted by terminal EL
+    const allSats = [];
+    for (let s = 0; s < numSats; s++) {
+      const sl = satLon(s, simTime, numSats);
+      const el = elevAngle(termLat, termLon, sl);
+      allSats.push({ idx: s, name: satNames[s], el: +el.toFixed(1), satLon: sl });
+    }
+    allSats.sort((a, b) => b.el - a.el);
+    if (allSats.length === 0) return null;
+    const bestTermEl = allSats[0].el;
+    // Tier 1: any sat above gwMinEl?
+    if (bestTermEl < gwMin) {
+      return { sat: null, gw: null, reason: `No satellite above ${gwMin}deg from terminal` };
+    }
+    // For each sat, find best gateway
+    const fullyViable = [];
+    for (const s of allSats) {
+      if (s.el < ka2517Min) break;
+      let bestGw = null, bestGwEl = -90;
+      for (const gw of gws) {
+        const gwEl = elevAngle(gw.lat, gw.lon, s.satLon);
+        if (gwEl > bestGwEl) { bestGwEl = gwEl; bestGw = gw; }
+      }
+      if (bestGwEl >= gwMin && bestGw) {
+        fullyViable.push({ ...s, bestGw, bestGwEl: +bestGwEl.toFixed(1) });
+      }
+    }
+    if (fullyViable.length === 0) {
+      const termOk = bestTermEl >= ka2517Min;
+      if (!termOk) {
+        return { sat: allSats[0], gw: null, satEl: bestTermEl,
+                 reason: `Best sat ${allSats[0].name} below Ka2517 floor (${bestTermEl.toFixed(1)}deg < ${ka2517Min}deg)` };
+      }
+      return { sat: allSats[0], gw: null, satEl: bestTermEl,
+               reason: `No gateway sees ${allSats[0].name} at >=${gwMin}deg` };
+    }
+    // Pick the highest-EL sat that's fully viable
+    const sel = fullyViable[0];
+    // Reason: was this the highest-terminal-EL sat overall?
+    const isHighestOverall = sel.idx === allSats[0].idx;
+    let reason;
+    if (isHighestOverall) {
+      reason = `Highest terminal EL (${sel.el}deg) and gateway ${sel.bestGw.id} sees it at ${sel.bestGwEl}deg`;
+    } else {
+      // The terminal-best sat had no gateway; we picked a lower one with gateway coverage
+      const skipped = allSats[0];
+      reason = `Best terminal sat ${skipped.name} (${skipped.el}deg) has no gateway in view; using ${sel.name} (${sel.el}deg) which gateway ${sel.bestGw.id} sees at ${sel.bestGwEl}deg`;
+    }
+    return { sat: sel, gw: sel.bestGw, satEl: sel.el, gwEl: sel.bestGwEl, reason, fallback: !isHighestOverall };
+  }, [simTime, numSats, satNames, termLat, termLon, activeGateways, gwMinEl, ka2517MinEl]);
 
   const targetSats = selSat === -1 ? inViewSats : inViewSats.filter(s => s.idx === selSat);
 
@@ -1226,6 +1284,85 @@ function BeamProjectionTab({ simTime, numSats, satNames, gpLat, gpLon, flightAct
       }
     }
 
+    // ── Gateway markers + active link visualization ──────────
+    // Draw all active gateways as orange squares; the active one is highlighted.
+    const gws = activeGateways || [];
+    if (gws.length > 0) {
+      ctx.save();
+      for (const gw of gws) {
+        const pG = proj([gw.lon, gw.lat]);
+        if (!pG) continue;
+        const isActive = activeLink && activeLink.gw && activeLink.gw.id === gw.id;
+        const sz = isActive ? 6 : 4;
+        ctx.beginPath();
+        ctx.rect(pG[0] - sz, pG[1] - sz, sz * 2, sz * 2);
+        if (isActive) {
+          ctx.fillStyle = "#ff9900cc";
+          ctx.strokeStyle = "#ff9900";
+          ctx.lineWidth = 2;
+          // Pulsing glow
+          ctx.shadowColor = "#ff9900";
+          ctx.shadowBlur = 12;
+        } else {
+          ctx.fillStyle = "#ff990044";
+          ctx.strokeStyle = "#ff990088";
+          ctx.lineWidth = 1;
+        }
+        ctx.fill();
+        ctx.stroke();
+        ctx.shadowBlur = 0;
+        // Label
+        ctx.fillStyle = isActive ? "#ff9900" : "#ff990088";
+        ctx.font = isActive ? "bold 9px 'Courier New'" : "8px 'Courier New'";
+        ctx.textAlign = "left";
+        ctx.shadowColor = "rgba(0,0,0,0.9)"; ctx.shadowBlur = 3;
+        ctx.fillText(gw.id, pG[0] + sz + 3, pG[1] + 3);
+        ctx.shadowBlur = 0;
+      }
+      ctx.restore();
+    }
+
+    // Draw active link path: terminal -> active satellite (subsat point) -> active gateway
+    if (activeLink && activeLink.sat && activeLink.gw) {
+      const pTerm  = proj([termLon, termLat]);
+      const pSat   = proj([activeLink.sat.satLon, 0]);
+      const pGw    = proj([activeLink.gw.lon, activeLink.gw.lat]);
+      if (pTerm && pSat && pGw) {
+        ctx.save();
+        ctx.strokeStyle = "#00ff88";
+        ctx.lineWidth = 1.6;
+        ctx.setLineDash([6, 3]);
+        ctx.shadowColor = "#00ff88";
+        ctx.shadowBlur = 6;
+        // Terminal -> sat
+        ctx.beginPath();
+        ctx.moveTo(pTerm[0], pTerm[1]);
+        ctx.lineTo(pSat[0], pSat[1]);
+        ctx.stroke();
+        // Sat -> gateway
+        ctx.beginPath();
+        ctx.moveTo(pSat[0], pSat[1]);
+        ctx.lineTo(pGw[0], pGw[1]);
+        ctx.stroke();
+        ctx.restore();
+      }
+    } else if (activeLink && activeLink.sat && !activeLink.gw) {
+      // Terminal sees sat but no gateway: dashed red line, terminal -> subsat
+      const pTerm = proj([termLon, termLat]);
+      const pSat  = proj([activeLink.sat.satLon, 0]);
+      if (pTerm && pSat) {
+        ctx.save();
+        ctx.strokeStyle = "#ff6b35";
+        ctx.lineWidth = 1.4;
+        ctx.setLineDash([4, 4]);
+        ctx.beginPath();
+        ctx.moveTo(pTerm[0], pTerm[1]);
+        ctx.lineTo(pSat[0], pSat[1]);
+        ctx.stroke();
+        ctx.restore();
+      }
+    }
+
     const pT = proj([termLon, termLat]);
     if (pT) {
       if (isGateway) {
@@ -1268,7 +1405,7 @@ function BeamProjectionTab({ simTime, numSats, satNames, gpLat, gpLon, flightAct
 
   }, [ready, simTime, numSats, termLat, termLon, termAlt, beamHalf, showPassRegion, showDualIllum,
       selSat, targetSats, inViewSats, projection, isGateway, limitElev, limitElevVal, fixedBeams,
-      mapZoom, mapCenter, elThresh]);
+      mapZoom, mapCenter, elThresh, activeGateways, activeLink]);
 
   const fmtKm = function(v) { return v >= 1000 ? (v/1000).toFixed(1) + " Mm" : v.toFixed(0) + " km"; };
 
@@ -1534,6 +1671,49 @@ function BeamProjectionTab({ simTime, numSats, satNames, gpLat, gpLon, flightAct
                 <div style={{background:"#0d1a2a99",border:"1px solid #1e3055",borderRadius:"3px",
                   padding:"2px 4px",textAlign:"center",color:"#4a6a8a",fontSize:"8px",fontFamily:"'Courier New',monospace"}}>
                   {mapZoom.toFixed(1)}x
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* ── ACTIVE LINK status panel ── */}
+          <div style={panelStyle}>
+            <div style={secStyle}>ACTIVE LINK</div>
+            {!activeLink ? (
+              <div style={{color:"#3a5a7a",fontSize:"9px",fontStyle:"italic"}}>Computing...</div>
+            ) : !activeLink.sat || !activeLink.gw ? (
+              <div>
+                <div style={{display:"flex",alignItems:"center",gap:"6px",marginBottom:"6px"}}>
+                  <span style={{color:"#ff6b35",fontSize:"10px",fontWeight:"bold"}}>X CLOSED</span>
+                  {activeLink.sat && (
+                    <span style={{color:SAT_COLORS[activeLink.sat.idx % SAT_COLORS.length],fontSize:"10px"}}>
+                      {activeLink.sat.name} EL {activeLink.sat.el}deg
+                    </span>
+                  )}
+                </div>
+                <div style={{color:"#a0c0e0",fontSize:"9px",lineHeight:"1.5"}}>
+                  {activeLink.reason}
+                </div>
+              </div>
+            ) : (
+              <div>
+                <div style={{display:"grid",gridTemplateColumns:"auto auto 1fr",gap:"6px 10px",fontSize:"10px",alignItems:"center",marginBottom:"6px"}}>
+                  <span style={{color:"#4a6a8a"}}>SAT:</span>
+                  <span style={{color:SAT_COLORS[activeLink.sat.idx % SAT_COLORS.length],fontWeight:"bold"}}>
+                    {activeLink.sat.name}
+                  </span>
+                  <span style={{color:"#8ab0d0"}}>{activeLink.satEl}deg from terminal</span>
+                  <span style={{color:"#4a6a8a"}}>GW:</span>
+                  <span style={{color:"#ff9900",fontWeight:"bold"}}>{activeLink.gw.id}</span>
+                  <span style={{color:"#8ab0d0"}}>{activeLink.gwEl}deg from sat ({activeLink.gw.name})</span>
+                </div>
+                <div style={{color:"#4a6a8a",fontSize:"9px",letterSpacing:"0.05em",marginTop:"8px",marginBottom:"3px"}}>
+                  REASON
+                </div>
+                <div style={{color:activeLink.fallback?"#ffd700":"#7fff00",fontSize:"9px",lineHeight:"1.5",
+                  background:activeLink.fallback?"#1a1408":"#0d1a14",
+                  border:`1px solid ${activeLink.fallback?"#ffd70044":"#00ff8844"}`,borderRadius:"3px",padding:"5px 7px"}}>
+                  {activeLink.fallback ? "[!] " : "[OK] "}{activeLink.reason}
                 </div>
               </div>
             )}
@@ -7040,6 +7220,9 @@ export default function O3bSimulator() {
               callsign: flightData.isReal ? (flightData.callsign || "real flight") : `${flightData.origin?.iata||""} → ${flightData.dest?.iata||""}`,
               progress: flightData.progress,
             } : null}
+            activeGateways={activeGateways}
+            gwMinEl={gwMinEl}
+            ka2517MinEl={ka2517MinEl}
           />
         )}
 
