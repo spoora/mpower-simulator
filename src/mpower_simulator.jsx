@@ -8,7 +8,7 @@ import {
 // ═══════════════════════════════════════════════════════════════
 // ORBITAL CONSTANTS — O3b mPOWER
 // ═══════════════════════════════════════════════════════════════
-const VERSION = "v4.11.2";
+const VERSION = "v4.11.3";
 const Re     = 6371;
 const h_orb  = 8063;
 const Rs     = Re + h_orb;
@@ -867,7 +867,7 @@ function BeamProjectionTab({ simTime, numSats, satNames, gpLat, gpLon, flightAct
   const [termLat,  setTermLat]  = useState(gpLat);
   const [termLon,  setTermLon]  = useState(gpLon);
   const [termAlt,  setTermAlt]  = useState(0.0);
-  const [beamHalf, setBeamHalf] = useState(0.8);
+  const [beamHalf, setBeamHalf] = useState(3.0);
   const [minElev,  setMinElev]  = useState(10);
   const [numSatMin,setNumSatMin]= useState(1);
   const [maxSep,   setMaxSep]   = useState(60);
@@ -3950,7 +3950,7 @@ export default function O3bSimulator() {
   const [realFlightResults, setRealFlightResults] = useState(null); // null | array | "loading" | "error:..."
   const [realFlightSelected, setRealFlightSelected] = useState(null); // selected flight metadata
   const [realFlightTrack,   setRealFlightTrack]   = useState(null);   // {points:[{t,lat,lon,alt}], duration, info}
-  const [strategyBeamHalf,  setStrategyBeamHalf]  = useState(0.8);    // half beam-width (deg) used by STRATEGY tab footprint-area calc
+  const [strategyBeamHalf,  setStrategyBeamHalf]  = useState(3.0);    // half beam-width (deg) used by STRATEGY tab footprint-area calc
   const [realFlightLoading, setRealFlightLoading] = useState(false);
   const [realFlightError,   setRealFlightError]   = useState(null);
   const [aptQReal,          setAptQReal]          = useState("");
