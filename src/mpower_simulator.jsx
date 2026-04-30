@@ -8,7 +8,7 @@ import {
 // ═══════════════════════════════════════════════════════════════
 // ORBITAL CONSTANTS — O3b mPOWER
 // ═══════════════════════════════════════════════════════════════
-const VERSION = "v4.11.1";
+const VERSION = "v4.11.2";
 const Re     = 6371;
 const h_orb  = 8063;
 const Rs     = Re + h_orb;
@@ -858,7 +858,7 @@ function beamFootprintPolygon(termLat, termLon, satLonDeg, elDeg, beamHalfDeg, n
   return { type: "Feature", geometry: { type: "Polygon", coordinates: [pts] } };
 }
 
-function BeamProjectionTab({ simTime, numSats, satNames, gpLat, gpLon, flightActive, flightInfo, activeGateways, gwMinEl, ka2517MinEl }) {
+function BeamProjectionTab({ simTime, numSats, satNames, gpLat, gpLon, flightActive, flightInfo, activeGateways, gwMinEl, ka2517MinEl, onRestartFlight }) {
   const canvasRef  = useRef(null);
   const worldRef   = useRef(null);
   const dragRef    = useRef(null);
@@ -1519,6 +1519,13 @@ function BeamProjectionTab({ simTime, numSats, satNames, gpLat, gpLon, flightAct
                   </span>
                 )}
               </label>
+            )}
+            {flightActive && onRestartFlight && (
+              <button onClick={onRestartFlight}
+                style={{...btnStyle,width:"100%",marginBottom:"8px",
+                  color:"#00ff88",border:"1px solid #00ff88",background:"#00ff8815",fontWeight:"bold"}}>
+                ↺ RESTART FLIGHT
+              </button>
             )}
             <div style={{marginBottom:"6px"}}>
               <label style={labelStyle}>Longitude (deg)</label>
@@ -7701,6 +7708,12 @@ export default function O3bSimulator() {
             activeGateways={activeGateways}
             gwMinEl={gwMinEl}
             ka2517MinEl={ka2517MinEl}
+            onRestartFlight={flightOrigin && flightDest ? (() => {
+              setFlightStartTime(simTime);
+              setGpLat(flightOrigin.lat); setGpLon(flightOrigin.lon);
+              setPins([]); setSelectedCity(null);
+              if (!playing) setPlaying(true);
+            }) : null}
           />
         )}
 
