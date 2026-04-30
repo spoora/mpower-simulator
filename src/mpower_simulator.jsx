@@ -8,7 +8,7 @@ import {
 // ═══════════════════════════════════════════════════════════════
 // ORBITAL CONSTANTS — O3b mPOWER
 // ═══════════════════════════════════════════════════════════════
-const VERSION = "v4.12.1";
+const VERSION = "v4.12.3";
 const Re     = 6371;
 const h_orb  = 8063;
 const Rs     = Re + h_orb;
@@ -1363,23 +1363,29 @@ function BeamProjectionTab({ simTime, numSats, satNames, gpLat, gpLon, flightAct
     }
 
     // Draw active link path: terminal -> active satellite (subsat point) -> active gateway
+    // The terminal-to-sat segment uses the satellite's color (so it matches the IN-VIEW
+    // legend and S1/S2/S3 colors). The sat-to-gateway segment stays green (gateway link).
     if (activeLink && activeLink.sat && activeLink.gw) {
       const pTerm  = proj([termLon, termLat]);
       const pSat   = proj([activeLink.sat.satLon, 0]);
       const pGw    = proj([activeLink.gw.lon, activeLink.gw.lat]);
+      const satColor = SAT_COLORS[activeLink.sat.idx % SAT_COLORS.length];
       if (pTerm && pSat && pGw) {
         ctx.save();
-        ctx.strokeStyle = "#00ff88";
         ctx.lineWidth = 1.6;
         ctx.setLineDash([6, 3]);
-        ctx.shadowColor = "#00ff88";
-        ctx.shadowBlur = 6;
-        // Terminal -> sat
+        // Terminal -> sat (color = satellite color)
+        ctx.strokeStyle = satColor;
+        ctx.shadowColor = satColor;
+        ctx.shadowBlur  = 6;
         ctx.beginPath();
         ctx.moveTo(pTerm[0], pTerm[1]);
         ctx.lineTo(pSat[0], pSat[1]);
         ctx.stroke();
-        // Sat -> gateway
+        // Sat -> gateway (color = gateway green)
+        ctx.strokeStyle = "#00ff88";
+        ctx.shadowColor = "#00ff88";
+        ctx.shadowBlur  = 6;
         ctx.beginPath();
         ctx.moveTo(pSat[0], pSat[1]);
         ctx.lineTo(pGw[0], pGw[1]);
@@ -4054,7 +4060,21 @@ export default function O3bSimulator() {
       const end   = begin + 86400;
       const url = `${OPENSKY_PROXY}/api/flights/departure?airport=${encodeURIComponent(icao)}&begin=${begin}&end=${end}`;
       const res = await fetch(url);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      if (!res.ok) {
+        if (res.status === 404) {
+          throw new Error("NO_FLIGHTS_FOUND");
+        }
+        if (res.status === 403) {
+          throw new Error("OpenSky rate-limited or auth issue (HTTP 403). Try again later.");
+        }
+        if (res.status === 429) {
+          throw new Error("Too many requests — wait a minute and retry.");
+        }
+        if (res.status >= 500) {
+          throw new Error(`OpenSky service error (HTTP ${res.status}). Try again in a moment.`);
+        }
+        throw new Error(`HTTP ${res.status}`);
+      }
       const text = await res.text();
       let data;
       try { data = JSON.parse(text); } catch { throw new Error("Invalid JSON response"); }
@@ -4073,7 +4093,19 @@ export default function O3bSimulator() {
       setRecentAirports(updated);
       lsSet(LS_RECENT_AIRPORTS, updated);
     } catch (err) {
-      setRealFlightError(`Search failed: ${err.message}`);
+      let friendly;
+      if (err.message === "NO_FLIGHTS_FOUND") {
+        // Format the date nicely
+        const dateLabel = dateStr || "the selected date";
+        friendly = `No flights found for ${icao} on ${dateLabel}. ` +
+                   `Try a larger hub (KJFK, EGLL, OMDB), a date 2-7 days ago, ` +
+                   `or check that the airport code is correct.`;
+      } else if (err.message.includes("HTTP")) {
+        friendly = `Search failed: ${err.message}`;
+      } else {
+        friendly = err.message;
+      }
+      setRealFlightError(friendly);
       setRealFlightResults("error:" + err.message);
     } finally {
       setRealFlightLoading(false);
@@ -4090,7 +4122,15 @@ export default function O3bSimulator() {
       const midTime = Math.floor((flight.firstSeen + flight.lastSeen) / 2);
       const url = `${OPENSKY_PROXY}/api/tracks/all?icao24=${encodeURIComponent(flight.icao24)}&time=${midTime}`;
       const res = await fetch(url);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      if (!res.ok) {
+        if (res.status === 404) {
+          throw new Error("No ADS-B track recorded for this flight (gap in coverage).");
+        }
+        if (res.status === 403) {
+          throw new Error("OpenSky rate-limited or auth issue (HTTP 403). Try again later.");
+        }
+        throw new Error(`HTTP ${res.status}`);
+      }
       const text = await res.text();
       let data;
       try { data = JSON.parse(text); } catch { throw new Error("Invalid JSON track response"); }
@@ -4160,7 +4200,11 @@ export default function O3bSimulator() {
       setRecentFlights(updatedFlights);
       lsSet(LS_RECENT_FLIGHTS, updatedFlights);
     } catch (err) {
-      setRealFlightError(`Track load failed: ${err.message}`);
+      // If already a sentence, present as-is; otherwise prefix
+      const msg = (err.message && /[.!?]$/.test(err.message))
+        ? err.message
+        : `Track load failed: ${err.message}`;
+      setRealFlightError(msg);
     } finally {
       setRealFlightLoading(false);
     }
