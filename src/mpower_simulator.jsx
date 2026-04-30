@@ -8,7 +8,7 @@ import {
 // ═══════════════════════════════════════════════════════════════
 // ORBITAL CONSTANTS — O3b mPOWER
 // ═══════════════════════════════════════════════════════════════
-const VERSION = "v4.12.0";
+const VERSION = "v4.12.1";
 const Re     = 6371;
 const h_orb  = 8063;
 const Rs     = Re + h_orb;
@@ -4762,24 +4762,75 @@ export default function O3bSimulator() {
       return out;
     }
 
-    // ─── Strategy S3: free pick (any GW, any sat) ───
+    // ─── Strategy S3: free pick (any GW, any sat) with anti-thrashing hysteresis ───
+    // SAT_HYS (terminal EL): keep current sat unless an alternative beats it by >= SAT_HYS deg
+    // GW_HYS  (gateway EL):  keep current GW  unless an alternative beats it by >= GW_HYS deg
+    // Both checks compare against the actual current pair, not just the per-sample best.
     function runS3() {
+      const GW_HYS = 3;
       const out = [];
-      let prevSat = -1, prevGw = null, satHo = 0, gwHo = 0;
+      let prevSat = -1, prevGwId = null, satHo = 0, gwHo = 0;
       for (let i = 0; i < samples.length; i++) {
         const s = samples[i];
-        let chosen = null;
+
+        // Build viable (sat, gw, gwEl) candidates for this sample, sorted by sat.el desc
+        const candidates = []; // each: { sat, gwBest, gwBestEl }
         for (const sat of s.satEls) {
           if (sat.el < ka2517Min) break;
           const list = s.gwViable[sat.idx] || [];
-          if (list.length > 0) { chosen = { sat, gw: list[0].gw, gwEl: list[0].gwEl }; break; }
+          if (list.length > 0) candidates.push({ sat, gwBest: list[0].gw, gwBestEl: list[0].gwEl, gwOptions: list });
         }
-        if (!chosen) { out.push({ closed: true }); continue; }
-        if (prevSat >= 0 && chosen.sat.idx !== prevSat) satHo++;
-        if (prevGw && chosen.gw.id !== prevGw) gwHo++;
-        prevSat = chosen.sat.idx; prevGw = chosen.gw.id;
-        out.push({ closed: false, el: chosen.sat.el, area: footprintAreaKm2(chosen.sat.el),
-                   satIdx: chosen.sat.idx, gwId: chosen.gw.id });
+
+        if (candidates.length === 0) {
+          out.push({ closed: true });
+          // Don't reset prevSat/prevGwId here — if next sample is closable, we still want
+          // to apply hysteresis against the last-known choice rather than treating it as fresh.
+          continue;
+        }
+
+        // ── Sat selection with hysteresis ──
+        // If the previous sat is still in candidates, check if any alternative beats it by >= SAT_HYS
+        let chosenSat;
+        const prevSatCand = prevSat >= 0 ? candidates.find(c => c.sat.idx === prevSat) : null;
+        if (prevSatCand) {
+          const bestAlt = candidates[0]; // candidates sorted by sat.el desc
+          if (bestAlt.sat.idx === prevSatCand.sat.idx) {
+            chosenSat = prevSatCand;
+          } else if ((bestAlt.sat.el - prevSatCand.sat.el) >= SAT_HYS) {
+            chosenSat = bestAlt; // alternative is significantly better
+          } else {
+            chosenSat = prevSatCand; // hysteresis holds
+          }
+        } else {
+          chosenSat = candidates[0]; // no previous sat or it's not viable — pick highest-EL
+        }
+
+        // ── GW selection within the chosen satellite, with hysteresis ──
+        // If previous GW can still see this satellite, prefer it unless an alternative
+        // beats it by >= GW_HYS deg.
+        let chosenGw, chosenGwEl;
+        const prevGwOption = prevGwId
+          ? chosenSat.gwOptions.find(o => o.gw.id === prevGwId)
+          : null;
+        if (prevGwOption) {
+          const bestGwOption = chosenSat.gwOptions[0]; // sorted by gwEl desc
+          if (bestGwOption.gw.id === prevGwOption.gw.id) {
+            chosenGw = prevGwOption.gw; chosenGwEl = prevGwOption.gwEl;
+          } else if ((bestGwOption.gwEl - prevGwOption.gwEl) >= GW_HYS) {
+            chosenGw = bestGwOption.gw; chosenGwEl = bestGwOption.gwEl;
+          } else {
+            chosenGw = prevGwOption.gw; chosenGwEl = prevGwOption.gwEl;
+          }
+        } else {
+          chosenGw = chosenSat.gwBest; chosenGwEl = chosenSat.gwBestEl;
+        }
+
+        if (prevSat >= 0 && chosenSat.sat.idx !== prevSat) satHo++;
+        if (prevGwId && chosenGw.id !== prevGwId) gwHo++;
+        prevSat = chosenSat.sat.idx;
+        prevGwId = chosenGw.id;
+        out.push({ closed: false, el: chosenSat.sat.el, area: footprintAreaKm2(chosenSat.sat.el),
+                   satIdx: chosenSat.sat.idx, gwId: chosenGw.id });
       }
       return { samples: out, satHo, gwHo };
     }
