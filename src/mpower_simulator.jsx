@@ -8,7 +8,7 @@ import {
 // ═══════════════════════════════════════════════════════════════
 // ORBITAL CONSTANTS — O3b mPOWER
 // ═══════════════════════════════════════════════════════════════
-const VERSION = "v4.12.3";
+const VERSION = "v4.12.4";
 const Re     = 6371;
 const h_orb  = 8063;
 const Rs     = Re + h_orb;
@@ -4682,8 +4682,14 @@ export default function O3bSimulator() {
     if (tab !== "strategy" || !flightMode || !flightOrigin || !flightDest || flightStartTime === null) return null;
     if (!activeGateways || activeGateways.length === 0) return { error: "No active gateways selected" };
 
+    // Duration: prefer real-flight track duration when loaded, else great-circle estimate.
+    // For real ADS-B loads the great-circle dist between origin and dest is often a poor
+    // proxy for the actual flown duration (loops, holding patterns, weather routing).
     const dist = gcDist(flightOrigin.lat, flightOrigin.lon, flightDest.lat, flightDest.lon);
-    const durationSec = dist / FLIGHT_SPEED_KMS;
+    const gcDurationSec = dist / FLIGHT_SPEED_KMS;
+    const durationSec = (realFlightTrack && realFlightTrack.duration && realFlightTrack.duration > 0)
+      ? realFlightTrack.duration
+      : gcDurationSec;
     const N = 200;
     const dt_hr = (durationSec / N) / 3600;
     const ka2517Min = ka2517MinEl ?? 20;
