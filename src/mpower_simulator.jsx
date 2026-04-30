@@ -1,14 +1,14 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import * as d3 from "d3";
 import {
-  LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip,
+  LineChart, Line, AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip,
   Legend, ResponsiveContainer, ReferenceLine,
 } from "recharts";
 
 // ═══════════════════════════════════════════════════════════════
 // ORBITAL CONSTANTS — O3b mPOWER
 // ═══════════════════════════════════════════════════════════════
-const VERSION = "v4.11.0";
+const VERSION = "v4.11.1";
 const Re     = 6371;
 const h_orb  = 8063;
 const Rs     = Re + h_orb;
@@ -3943,6 +3943,7 @@ export default function O3bSimulator() {
   const [realFlightResults, setRealFlightResults] = useState(null); // null | array | "loading" | "error:..."
   const [realFlightSelected, setRealFlightSelected] = useState(null); // selected flight metadata
   const [realFlightTrack,   setRealFlightTrack]   = useState(null);   // {points:[{t,lat,lon,alt}], duration, info}
+  const [strategyBeamHalf,  setStrategyBeamHalf]  = useState(0.8);    // half beam-width (deg) used by STRATEGY tab footprint-area calc
   const [realFlightLoading, setRealFlightLoading] = useState(false);
   const [realFlightError,   setRealFlightError]   = useState(null);
   const [aptQReal,          setAptQReal]          = useState("");
@@ -4637,7 +4638,7 @@ export default function O3bSimulator() {
     const ka2517Min = ka2517MinEl ?? 20;
     const gwMin     = gwMinEl ?? 10;
     const SAT_HYS   = 2;
-    const BEAM_HALF = 0.8; // deg, same as Beam Projection default
+    const BEAM_HALF = strategyBeamHalf;
 
     // Pre-compute path positions and per-step satellite geometry once
     const samples = []; // {pos, satEls:[{idx, el, satLon}]}
@@ -4657,14 +4658,17 @@ export default function O3bSimulator() {
       samples.push({ pos, t, satEls });
     }
 
-    // Helper: splash-zone radius (along-track semi-axis) at given EL
-    function splashKm(el) {
+    // Footprint area (km^2) for the active beam at given terminal EL.
+    // The beam ellipse on the ground has cross-track semi-axis b = d * tan(beamHalf)
+    // and along-track semi-axis a = b / sin(EL). Area = pi * a * b.
+    // Lower elevations therefore inflate the footprint dramatically.
+    function footprintAreaKm2(el) {
       if (el < 1) return null;
       const d = groundSlantRange(Math.max(el, 1));
       const tanA = Math.tan(toRad(BEAM_HALF));
       const b = d * tanA;
       const a = b / Math.sin(toRad(Math.max(el, 1)));
-      return a;
+      return Math.PI * a * b;
     }
 
     // ── Strategy S3: free-pick (optimal sat+gw at every step) ──
@@ -4692,7 +4696,7 @@ export default function O3bSimulator() {
         if (prevGw && chosen.gw.id !== prevGw) gwHo++;
         prevSat = chosen.sat.idx;
         prevGw  = chosen.gw.id;
-        out.push({ el: chosen.sat.el, splash: splashKm(chosen.sat.el), satIdx: chosen.sat.idx, gwId: chosen.gw.id, closed: false });
+        out.push({ el: chosen.sat.el, area: footprintAreaKm2(chosen.sat.el), satIdx: chosen.sat.idx, gwId: chosen.gw.id, closed: false });
       }
       return { samples: out, satHo, gwHo };
     }
@@ -4719,7 +4723,7 @@ export default function O3bSimulator() {
         if (cur && (viable[0].el - cur.el) < SAT_HYS) chosen = cur;
         if (prevSat >= 0 && chosen.idx !== prevSat) satHo++;
         prevSat = chosen.idx;
-        out.push({ el: chosen.el, splash: splashKm(chosen.el), satIdx: chosen.idx, gwId: gw.id, closed: false });
+        out.push({ el: chosen.el, area: footprintAreaKm2(chosen.el), satIdx: chosen.idx, gwId: gw.id, closed: false });
       }
       return { samples: out, satHo, gwHo: 0 };
     }
@@ -4755,7 +4759,7 @@ export default function O3bSimulator() {
           out.push({ closed: true });
           continue;
         }
-        out.push({ el: chosen.el, splash: splashKm(chosen.el), satIdx: chosen.idx, gwId: gw.id, closed: false });
+        out.push({ el: chosen.el, area: footprintAreaKm2(chosen.el), satIdx: chosen.idx, gwId: gw.id, closed: false });
       }
       return { samples: out, satHo, gwHo: 0 };
     }
@@ -4767,67 +4771,98 @@ export default function O3bSimulator() {
     for (const gw of activeGateways) {
       const r = runS1(gw);
       const closedSamples = r.samples.filter(x => !x.closed);
-      const meanSplash = closedSamples.length
-        ? closedSamples.reduce((a, x) => a + x.splash, 0) / closedSamples.length
+      const meanArea = closedSamples.length
+        ? closedSamples.reduce((acc, x) => acc + x.area, 0) / closedSamples.length
         : Infinity;
-      allS1Results[gw.id] = { meanSplash, openCount: closedSamples.length, run: r };
-      if (meanSplash < bestS1Score) { bestS1Score = meanSplash; bestGw = gw; bestS1 = r; }
+      allS1Results[gw.id] = { meanArea, openCount: closedSamples.length, run: r };
+      if (meanArea < bestS1Score) { bestS1Score = meanArea; bestGw = gw; bestS1 = r; }
     }
     if (!bestGw) return { error: "No gateway can serve any portion of this flight" };
     const s2 = runS2(bestGw);
     const s3 = runS3();
 
     // Compose chart data
+    // Stacked layout: y-bottom = S3 area, then S2 increment on top, then S1 increment on top.
+    // The visible thickness of each band == the *cost* of dropping to that strategy.
+    // Total stack height at any X = the S1 area for that sample.
     const chart = [];
-    let s1OpenSum = 0, s2OpenSum = 0, s3OpenSum = 0;
-    let s1OpenN   = 0, s2OpenN   = 0, s3OpenN   = 0;
-    let s1ClosedN = 0, s2ClosedN = 0, s3ClosedN = 0;
+    let s1Sum = 0, s2Sum = 0, s3Sum = 0;
+    let s1N = 0, s2N = 0, s3N = 0;
+    // Time-integrated area in km^2 * hours: sum(area * dt_hr), where dt_hr is per-sample width
+    const dt_hr = (durationSec / N) / 3600;
+    let s1AreaTime = 0, s2AreaTime = 0, s3AreaTime = 0;
+
     for (let i = 0; i <= N; i++) {
       const f = i / N;
       const pct = +(f * 100).toFixed(1);
-      const a = bestS1.samples[i];
-      const b = s2.samples[i];
-      const c = s3.samples[i];
-      const aS = a.closed ? null : a.splash;
-      const bS = b.closed ? null : b.splash;
-      const cS = c.closed ? null : c.splash;
-      // Stack increments: s3 is base, then (s2-s3) is the cost of locking GW with sat-switching,
-      // then (s1-s2) is the additional cost of locking the sat too.
-      let s3Layer = null, s2Layer = null, s1Layer = null;
+      const sa = bestS1.samples[i];
+      const sb = s2.samples[i];
+      const sc = s3.samples[i];
+      const aS = sa.closed ? null : sa.area;
+      const bS = sb.closed ? null : sb.area;
+      const cS = sc.closed ? null : sc.area;
+      // Stack increments. Note S3 <= S2 <= S1 by construction.
+      let s3Layer = null, s2Inc = null, s1Inc = null;
       if (cS !== null) s3Layer = cS;
-      if (bS !== null) s2Layer = (cS !== null) ? Math.max(0, bS - cS) : bS;
-      if (aS !== null) s1Layer = (bS !== null) ? Math.max(0, aS - bS) : (cS !== null ? Math.max(0, aS - cS) : aS);
+      if (bS !== null) s2Inc   = (cS !== null) ? Math.max(0, bS - cS) : bS;
+      if (aS !== null) s1Inc   = (bS !== null) ? Math.max(0, aS - bS) : (cS !== null ? Math.max(0, aS - cS) : aS);
       chart.push({
         pct,
-        s3: s3Layer, s2: s2Layer, s1: s1Layer,
+        s3Base: s3Layer,    // bottom layer (green)
+        s2Inc:  s2Inc,      // cost of locking GW (allow sat switches)
+        s1Inc:  s1Inc,      // cost of locking sat too (on top of S2)
         s1Total: aS, s2Total: bS, s3Total: cS,
-        s1Closed: a.closed, s2Closed: b.closed, s3Closed: c.closed,
+        s1Closed: sa.closed, s2Closed: sb.closed, s3Closed: sc.closed,
+        // Helpers for tooltip display: km^2 in pretty format
       });
-      if (aS !== null) { s1OpenSum += aS; s1OpenN++; } else s1ClosedN++;
-      if (bS !== null) { s2OpenSum += bS; s2OpenN++; } else s2ClosedN++;
-      if (cS !== null) { s3OpenSum += cS; s3OpenN++; } else s3ClosedN++;
+      if (aS !== null) { s1Sum += aS; s1N++; s1AreaTime += aS * dt_hr; }
+      if (bS !== null) { s2Sum += bS; s2N++; s2AreaTime += bS * dt_hr; }
+      if (cS !== null) { s3Sum += cS; s3N++; s3AreaTime += cS * dt_hr; }
     }
     const tot = N + 1;
+
     return {
       chart,
       bestGw,
       durationHours: +(durationSec / 3600).toFixed(2),
-      // Per-strategy summary
-      s1: { meanSplash: s1OpenN ? s1OpenSum / s1OpenN : null, satHo: bestS1.satHo, gwHo: 0,
-            availPct: +(s1OpenN / tot * 100).toFixed(1) },
-      s2: { meanSplash: s2OpenN ? s2OpenSum / s2OpenN : null, satHo: s2.satHo, gwHo: 0,
-            availPct: +(s2OpenN / tot * 100).toFixed(1) },
-      s3: { meanSplash: s3OpenN ? s3OpenSum / s3OpenN : null, satHo: s3.satHo, gwHo: s3.gwHo,
-            availPct: +(s3OpenN / tot * 100).toFixed(1) },
-      // Comparison of all GWs as single-GW candidates (for context)
-      gwScores: Object.entries(allS1Results).map(([id, r]) => ({
-        id,
-        name: activeGateways.find(g => g.id === id)?.name || id,
-        meanSplash: isFinite(r.meanSplash) ? r.meanSplash : null,
-        availPct: +(r.openCount / tot * 100).toFixed(1),
-      })).sort((a, b) => (a.meanSplash || Infinity) - (b.meanSplash || Infinity)),
+      beamHalfDeg: BEAM_HALF,
+      // Per-strategy summary: mean instantaneous area + total area-time (resource consumption)
+      s1: {
+        meanArea:   s1N ? s1Sum / s1N : null,
+        totalAreaH: s1AreaTime,                 // km^2 * hours
+        satHo: bestS1.satHo, gwHo: 0,
+        availPct: +(s1N / tot * 100).toFixed(1),
+      },
+      s2: {
+        meanArea:   s2N ? s2Sum / s2N : null,
+        totalAreaH: s2AreaTime,
+        satHo: s2.satHo, gwHo: 0,
+        availPct: +(s2N / tot * 100).toFixed(1),
+      },
+      s3: {
+        meanArea:   s3N ? s3Sum / s3N : null,
+        totalAreaH: s3AreaTime,
+        satHo: s3.satHo, gwHo: s3.gwHo,
+        availPct: +(s3N / tot * 100).toFixed(1),
+      },
+      // Per-GW S1 breakdown using area now
+      gwScores: Object.entries(allS1Results).map(([id, r]) => {
+        const closed = r.run.samples.filter(x => !x.closed);
+        const meanArea = closed.length
+          ? closed.reduce((acc, x) => acc + x.area, 0) / closed.length
+          : null;
+        const totalAreaH = closed.length
+          ? closed.reduce((acc, x) => acc + x.area * dt_hr, 0)
+          : 0;
+        return {
+          id,
+          name: activeGateways.find(g => g.id === id)?.name || id,
+          meanArea, totalAreaH,
+          availPct: +(r.openCount / tot * 100).toFixed(1),
+        };
+      }).sort((a, b) => (a.meanArea || Infinity) - (b.meanArea || Infinity)),
     };
-  }, [tab, flightMode, flightOrigin, flightDest, flightStartTime, numSats, activeGateways, gwMinEl, ka2517MinEl, realFlightTrack]);
+  }, [tab, flightMode, flightOrigin, flightDest, flightStartTime, numSats, activeGateways, gwMinEl, ka2517MinEl, realFlightTrack, strategyBeamHalf]);
 
   // TX / RX time ribbon — 200 segments across the full flight duration
   // Each segment is classified into the 9-condition table and mapped to a colour.
@@ -7481,34 +7516,51 @@ export default function O3bSimulator() {
                     <span style={{color:"#4a6a8a"}}>Best single GW for this route:</span>
                     <span style={{color:"#ff9900",fontWeight:"bold"}}>{strategyData.bestGw.id} ({strategyData.bestGw.name})</span>
                     <span style={{color:"#4a6a8a"}}>{strategyData.durationHours}h flight, {numSats} sats</span>
+                    {/* Beam half-width control */}
+                    <span style={{flex:1}}/>
+                    <label style={{color:"#8ab0d0",fontSize:"11px",display:"flex",alignItems:"center",gap:"5px"}}>
+                      Beam half-width
+                      <input type="number" min={0.1} max={5} step={0.1} value={strategyBeamHalf}
+                        onChange={e=>setStrategyBeamHalf(+e.target.value)}
+                        style={{...S.sel,width:"60px",fontSize:"11px"}} />
+                      <span style={{color:"#4a6a8a",fontSize:"10px"}}>deg</span>
+                    </label>
                   </div>
                   <div style={{color:"#5a7a9a",fontSize:"10px",marginTop:"5px",lineHeight:"1.4"}}>
-                    Splash zone radius = along-track semi-axis of the {0.8}deg beam footprint at the terminal.
-                    Smaller is better — less satellite resource consumed per closed link.
+                    <strong>Footprint area</strong> (km²) = pi · a · b, where a = b/sin(EL) is the along-track semi-axis.
+                    Lower elevation angles inflate the footprint dramatically. The stack chart below shows total
+                    instantaneous area by strategy; the colored bands above the green base are the *cost* of switching
+                    to that simpler strategy.
                   </div>
                 </div>
 
                 {/* Three summary cards */}
-                <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:"8px",marginBottom:"10px"}}>
+                <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:"8px",marginBottom:"12px"}}>
                   {[
                     { key:"s3", label:"S3 — FREE PICK",         color:"#00ff88", desc:"Optimal sat+GW at every step" },
                     { key:"s2", label:"S2 — SINGLE GW",         color:"#7fff00", desc:"One GW, switch sats opportunistically" },
                     { key:"s1", label:"S1 — SINGLE GW + LOCK",  color:"#ffd700", desc:"One GW, sat locked until forced switch" },
                   ].map(card => {
                     const d = strategyData[card.key];
+                    const baseline = strategyData.s3;
+                    const pctMore = (d.meanArea !== null && baseline.meanArea && baseline.meanArea > 0)
+                      ? ((d.meanArea - baseline.meanArea) / baseline.meanArea * 100) : null;
+                    const fmt = v => v == null ? "—" : v >= 1e6 ? `${(v/1e6).toFixed(2)} M km²` : v >= 1e4 ? `${(v/1e3).toFixed(1)} k km²` : `${v.toFixed(0)} km²`;
                     return (
                       <div key={card.key} style={{background:"#080f1a",border:`1px solid ${card.color}44`,
-                        borderLeft:`3px solid ${card.color}`,borderRadius:"3px",padding:"10px 12px"}}>
-                        <div style={{color:card.color,fontSize:"10px",fontWeight:"bold",letterSpacing:"0.05em",marginBottom:"4px"}}>
+                        borderLeft:`3px solid ${card.color}`,borderRadius:"3px",padding:"12px 14px"}}>
+                        <div style={{color:card.color,fontSize:"11px",fontWeight:"bold",letterSpacing:"0.05em",marginBottom:"5px"}}>
                           {card.label}
                         </div>
-                        <div style={{color:"#7a9ab8",fontSize:"10px",marginBottom:"8px",lineHeight:"1.3"}}>
+                        <div style={{color:"#7a9ab8",fontSize:"10px",marginBottom:"10px",lineHeight:"1.3"}}>
                           {card.desc}
                         </div>
-                        <div style={{display:"grid",gridTemplateColumns:"auto 1fr",gap:"3px 8px",fontSize:"11px"}}>
-                          <span style={{color:"#4a6a8a"}}>Mean splash:</span>
-                          <span style={{color:card.color,fontWeight:"bold"}}>
-                            {d.meanSplash !== null ? `${d.meanSplash.toFixed(1)} km` : "—"}
+                        <div style={{display:"grid",gridTemplateColumns:"auto 1fr",gap:"4px 10px",fontSize:"11px"}}>
+                          <span style={{color:"#4a6a8a"}}>Mean area:</span>
+                          <span style={{color:card.color,fontWeight:"bold"}}>{fmt(d.meanArea)}</span>
+                          <span style={{color:"#4a6a8a"}}>Total area·time:</span>
+                          <span style={{color:"#c0d8f0"}}>
+                            {d.totalAreaH ? `${d.totalAreaH.toFixed(0)} km²·h` : "—"}
                           </span>
                           <span style={{color:"#4a6a8a"}}>Availability:</span>
                           <span style={{color:"#c0d8f0"}}>{d.availPct}%</span>
@@ -7516,73 +7568,79 @@ export default function O3bSimulator() {
                           <span style={{color:"#c0d8f0"}}>{d.satHo}</span>
                           <span style={{color:"#4a6a8a"}}>GW handovers:</span>
                           <span style={{color:"#c0d8f0"}}>{d.gwHo}</span>
+                          {pctMore !== null && card.key !== "s3" && (
+                            <>
+                              <span style={{color:"#4a6a8a"}}>vs S3:</span>
+                              <span style={{color:pctMore > 50 ? "#ff6b35" : pctMore > 20 ? "#ffd700" : "#7fff00",fontWeight:"bold"}}>
+                                +{pctMore.toFixed(0)}% more area
+                              </span>
+                            </>
+                          )}
                         </div>
                       </div>
                     );
                   })}
                 </div>
 
-                {/* Stacked area chart */}
+                {/* Stacked area chart - ONE chart, three colored bands */}
                 <div style={{color:"#4a6a8a",fontSize:"10px",marginBottom:"6px",letterSpacing:"0.05em"}}>
-                  CONTRIBUTION STACK — splash zone radius (km) along flight progress
+                  FOOTPRINT AREA STACK — total instantaneous beam area (km²) along flight
                 </div>
-                <ResponsiveContainer width="100%" height={260}>
-                  <LineChart data={strategyData.chart} margin={{top:8,right:12,bottom:18,left:6}}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#152030"/>
-                    <XAxis dataKey="pct" stroke="#2e4270" tick={{fill:"#4a6a8a",fontSize:9}}
-                      label={{value:"Flight progress (%)",position:"insideBottom",offset:-8,fill:"#4a6a8a",fontSize:9}}/>
-                    <YAxis stroke="#2e4270" tick={{fill:"#4a6a8a",fontSize:9}}
-                      label={{value:"Splash radius (km)",angle:-90,position:"insideLeft",fill:"#4a6a8a",fontSize:9,offset:14}}/>
-                    <Tooltip contentStyle={{background:"#080f1a",border:"1px solid #2e4270",fontSize:"11px"}}
-                      labelFormatter={v=>`T+${(+v).toFixed(1)}%`}
-                      formatter={(v,k)=>{
-                        if (v === null || v === undefined) return ["—", k];
-                        return [`${(+v).toFixed(1)} km`, k];
-                      }}/>
-                    <Legend wrapperStyle={{fontSize:"10px"}}/>
-                    <Line type="monotone" dataKey="s3Total" stroke="#00ff88" strokeWidth={2} dot={false} name="S3 free-pick"/>
-                    <Line type="monotone" dataKey="s2Total" stroke="#7fff00" strokeWidth={1.5} dot={false} strokeDasharray="4 2" name="S2 single GW"/>
-                    <Line type="monotone" dataKey="s1Total" stroke="#ffd700" strokeWidth={1.5} dot={false} strokeDasharray="2 4" name="S1 single GW + lock"/>
-                  </LineChart>
-                </ResponsiveContainer>
+                <div style={{background:"#080f1a",border:"1px solid #1e3055",borderRadius:"3px",padding:"8px 4px"}}>
+                  <ResponsiveContainer width="100%" height={320}>
+                    <AreaChart data={strategyData.chart} margin={{top:8,right:14,bottom:18,left:18}}>
+                      <CartesianGrid strokeDasharray="3 3" stroke="#152030"/>
+                      <XAxis dataKey="pct" stroke="#2e4270" tick={{fill:"#4a6a8a",fontSize:9}}
+                        label={{value:"Flight progress (%)",position:"insideBottom",offset:-8,fill:"#4a6a8a",fontSize:9}}/>
+                      <YAxis stroke="#2e4270" tick={{fill:"#4a6a8a",fontSize:9}}
+                        tickFormatter={v=>v>=1000?`${(v/1000).toFixed(1)}k`:`${v.toFixed(0)}`}
+                        label={{value:"km²",angle:-90,position:"insideLeft",fill:"#4a6a8a",fontSize:9,offset:0}}/>
+                      <Tooltip
+                        contentStyle={{background:"#080f1a",border:"1px solid #2e4270",fontSize:"11px"}}
+                        labelFormatter={v=>`T+${(+v).toFixed(1)}%`}
+                        formatter={(v,k,p)=>{
+                          if (v == null) return ["—", k];
+                          const fmt = v >= 1e4 ? `${(v/1e3).toFixed(1)} k km²` : `${v.toFixed(0)} km²`;
+                          const labels = { s3Base:"S3 base (free pick)", s2Inc:"S2 increment (lock GW)", s1Inc:"S1 increment (lock sat)" };
+                          return [fmt, labels[k] || k];
+                        }}/>
+                      <Legend
+                        wrapperStyle={{fontSize:"10px"}}
+                        formatter={(v)=>{
+                          if (v === "s3Base") return "S3 base (free pick)";
+                          if (v === "s2Inc")  return "+ S2 cost (lock GW)";
+                          if (v === "s1Inc")  return "+ S1 cost (lock sat)";
+                          return v;
+                        }}/>
+                      {/* Stacked from bottom to top: green (S3), yellow-green (S2 inc), gold (S1 inc) */}
+                      <Area type="monotone" dataKey="s3Base" stackId="1" stroke="#00ff88" fill="#00ff8866" strokeWidth={1.5}/>
+                      <Area type="monotone" dataKey="s2Inc"  stackId="1" stroke="#7fff00" fill="#7fff0066" strokeWidth={1.5}/>
+                      <Area type="monotone" dataKey="s1Inc"  stackId="1" stroke="#ffd700" fill="#ffd70066" strokeWidth={1.5}/>
+                    </AreaChart>
+                  </ResponsiveContainer>
+                </div>
 
-                {/* Stack area - showing increments */}
+                {/* Per-gateway S1 score table - now using area */}
                 <div style={{color:"#4a6a8a",fontSize:"10px",marginTop:"14px",marginBottom:"6px",letterSpacing:"0.05em"}}>
-                  STRATEGY INCREMENTS — extra splash above S3 baseline
+                  SINGLE-GATEWAY CANDIDATES (S1 baseline — sorted by mean footprint area)
                 </div>
-                <ResponsiveContainer width="100%" height={200}>
-                  <LineChart data={strategyData.chart} margin={{top:8,right:12,bottom:18,left:6}}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#152030"/>
-                    <XAxis dataKey="pct" stroke="#2e4270" tick={{fill:"#4a6a8a",fontSize:9}}
-                      label={{value:"Flight progress (%)",position:"insideBottom",offset:-8,fill:"#4a6a8a",fontSize:9}}/>
-                    <YAxis stroke="#2e4270" tick={{fill:"#4a6a8a",fontSize:9}}
-                      label={{value:"Increment (km)",angle:-90,position:"insideLeft",fill:"#4a6a8a",fontSize:9,offset:14}}/>
-                    <Tooltip contentStyle={{background:"#080f1a",border:"1px solid #2e4270",fontSize:"11px"}}
-                      labelFormatter={v=>`T+${(+v).toFixed(1)}%`}
-                      formatter={(v,k)=>v===null||v===undefined?["—",k]:[`+${(+v).toFixed(1)} km`, k]}/>
-                    <Legend wrapperStyle={{fontSize:"10px"}}/>
-                    <Line type="monotone" dataKey="s2" stroke="#7fff00" strokeWidth={1.5} dot={false} name="S2 cost (vs S3)"/>
-                    <Line type="monotone" dataKey="s1" stroke="#ffd700" strokeWidth={1.5} dot={false} name="S1 extra cost (vs S2)"/>
-                  </LineChart>
-                </ResponsiveContainer>
-
-                {/* Per-gateway S1 score table */}
-                <div style={{color:"#4a6a8a",fontSize:"10px",marginTop:"14px",marginBottom:"6px",letterSpacing:"0.05em"}}>
-                  SINGLE-GATEWAY CANDIDATES (S1 baseline — sorted by mean splash)
-                </div>
-                <div style={{background:"#080f1a",border:"1px solid #2e4270",borderRadius:"3px",padding:"8px"}}>
-                  <div style={{display:"grid",gridTemplateColumns:"60px 1fr 100px 80px 80px",gap:"8px",
+                <div style={{background:"#080f1a",border:"1px solid #2e4270",borderRadius:"3px",padding:"10px"}}>
+                  <div style={{display:"grid",gridTemplateColumns:"50px 1fr 110px 110px 80px 90px",gap:"8px",
                     padding:"3px 0",borderBottom:"1px solid #2e4270",marginBottom:"3px",
                     color:"#4a6a8a",fontSize:"9px",letterSpacing:"0.05em"}}>
-                    <span>RANK</span><span>GATEWAY</span><span style={{textAlign:"right"}}>MEAN SPLASH</span>
-                    <span style={{textAlign:"right"}}>AVAIL</span><span style={{textAlign:"right"}}>vs BEST</span>
+                    <span>RANK</span><span>GATEWAY</span>
+                    <span style={{textAlign:"right"}}>MEAN AREA</span>
+                    <span style={{textAlign:"right"}}>TOTAL AREA·H</span>
+                    <span style={{textAlign:"right"}}>AVAIL</span>
+                    <span style={{textAlign:"right"}}>vs BEST</span>
                   </div>
                   {strategyData.gwScores.map((g, i) => {
                     const isBest = g.id === strategyData.bestGw.id;
-                    const delta = g.meanSplash !== null && strategyData.gwScores[0].meanSplash !== null
-                      ? g.meanSplash - strategyData.gwScores[0].meanSplash : null;
+                    const bestArea = strategyData.gwScores[0].meanArea;
+                    const delta = (g.meanArea !== null && bestArea !== null) ? g.meanArea - bestArea : null;
+                    const fmt = v => v == null ? "—" : v >= 1e6 ? `${(v/1e6).toFixed(2)} M` : v >= 1e3 ? `${(v/1e3).toFixed(1)} k` : `${v.toFixed(0)}`;
                     return (
-                      <div key={g.id} style={{display:"grid",gridTemplateColumns:"60px 1fr 100px 80px 80px",gap:"8px",
+                      <div key={g.id} style={{display:"grid",gridTemplateColumns:"50px 1fr 110px 110px 80px 90px",gap:"8px",
                         padding:"3px 0",borderBottom:"1px solid #152030",alignItems:"center",fontSize:"11px"}}>
                         <span style={{color:isBest?"#ff9900":"#4a6a8a",fontWeight:isBest?"bold":"normal"}}>
                           {isBest?"★ ":"  "}{i+1}
@@ -7591,13 +7649,16 @@ export default function O3bSimulator() {
                           {g.id} <span style={{color:"#5a7a9a"}}>{g.name}</span>
                         </span>
                         <span style={{color:"#c0d8f0",textAlign:"right"}}>
-                          {g.meanSplash !== null ? `${g.meanSplash.toFixed(1)} km` : "—"}
+                          {fmt(g.meanArea)} km²
+                        </span>
+                        <span style={{color:"#c0d8f0",textAlign:"right"}}>
+                          {g.totalAreaH ? `${g.totalAreaH.toFixed(0)} km²·h` : "—"}
                         </span>
                         <span style={{color:g.availPct >= 95 ? "#00ff88" : g.availPct >= 70 ? "#ffd700" : "#ff6b35",textAlign:"right"}}>
                           {g.availPct}%
                         </span>
                         <span style={{color:"#5a7a9a",textAlign:"right",fontSize:"10px"}}>
-                          {delta === null ? "—" : delta === 0 ? "—" : `+${delta.toFixed(1)} km`}
+                          {delta == null ? "—" : delta === 0 ? "★" : `+${fmt(delta)} km²`}
                         </span>
                       </div>
                     );
