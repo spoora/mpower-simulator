@@ -8,7 +8,7 @@ import {
 // ═══════════════════════════════════════════════════════════════
 // ORBITAL CONSTANTS — O3b mPOWER
 // ═══════════════════════════════════════════════════════════════
-const VERSION = "v4.9.0";
+const VERSION = "v4.9.1";
 const Re     = 6371;
 const h_orb  = 8063;
 const Rs     = Re + h_orb;
@@ -3794,9 +3794,16 @@ export default function O3bSimulator() {
   // ── OpenSky API helpers ────────────────────────────────────
   // Search flights departing from an airport on a given date
   async function searchRealFlights(icao, dateStr) {
+    // Clear any previously-loaded flight so the new results list isn't suppressed
+    // by the `!realFlightTrack` guard. Also clears origin/dest/start so a stale
+    // flight doesn't keep playing while the user picks a new one.
+    setRealFlightTrack(null);
+    setRealFlightSelected(null);
+    setFlightStartTime(null);
     setRealFlightLoading(true);
     setRealFlightError(null);
     setRealFlightResults("loading");
+    setResultsFilter("");
     try {
       // dateStr is YYYY-MM-DD; build [00:00, 24:00) UTC window
       const startMs = Date.parse(dateStr + "T00:00:00Z");
