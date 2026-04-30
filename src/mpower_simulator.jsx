@@ -8,7 +8,7 @@ import {
 // ═══════════════════════════════════════════════════════════════
 // ORBITAL CONSTANTS — O3b mPOWER
 // ═══════════════════════════════════════════════════════════════
-const VERSION = "v4.11.3";
+const VERSION = "v4.12.0";
 const Re     = 6371;
 const h_orb  = 8063;
 const Rs     = Re + h_orb;
@@ -4641,14 +4641,26 @@ export default function O3bSimulator() {
     const dist = gcDist(flightOrigin.lat, flightOrigin.lon, flightDest.lat, flightDest.lon);
     const durationSec = dist / FLIGHT_SPEED_KMS;
     const N = 200;
-    const dt_min = (durationSec / N) / 60;
+    const dt_hr = (durationSec / N) / 3600;
     const ka2517Min = ka2517MinEl ?? 20;
     const gwMin     = gwMinEl ?? 10;
     const SAT_HYS   = 2;
     const BEAM_HALF = strategyBeamHalf;
 
-    // Pre-compute path positions and per-step satellite geometry once
-    const samples = []; // {pos, satEls:[{idx, el, satLon}]}
+    // Footprint area helper
+    function footprintAreaKm2(el) {
+      if (el < 1) return null;
+      const d = groundSlantRange(Math.max(el, 1));
+      const tanA = Math.tan(toRad(BEAM_HALF));
+      const b = d * tanA;
+      const a = b / Math.sin(toRad(Math.max(el, 1)));
+      return Math.PI * a * b;
+    }
+
+    // ─── Pre-compute path positions and per-sample geometry ───
+    // For each sample, store the sorted sat list (each sat with idx, el, satLon)
+    // and per-gateway: which gateways can serve which sats at this sample.
+    const samples = [];
     for (let i = 0; i <= N; i++) {
       const f = i / N;
       const t = flightStartTime + f * durationSec;
@@ -4662,165 +4674,243 @@ export default function O3bSimulator() {
         satEls.push({ idx: s, el, satLon: sl });
       }
       satEls.sort((a, b) => b.el - a.el);
-      samples.push({ pos, t, satEls });
+
+      // For each (sat passing terminal threshold), find which active GWs see it >= gwMin.
+      // gwViable[satIdx] = [{gw, gwEl}] sorted desc by gwEl.
+      const gwViable = {};
+      for (const sat of satEls) {
+        if (sat.el < ka2517Min) continue;
+        const list = [];
+        for (const gw of activeGateways) {
+          const gwEl = elevAngle(gw.lat, gw.lon, sat.satLon);
+          if (gwEl >= gwMin) list.push({ gw, gwEl });
+        }
+        list.sort((a, b) => b.gwEl - a.gwEl);
+        gwViable[sat.idx] = list;
+      }
+      samples.push({ pos, t, satEls, gwViable });
     }
 
-    // Footprint area (km^2) for the active beam at given terminal EL.
-    // The beam ellipse on the ground has cross-track semi-axis b = d * tan(beamHalf)
-    // and along-track semi-axis a = b / sin(EL). Area = pi * a * b.
-    // Lower elevations therefore inflate the footprint dramatically.
-    function footprintAreaKm2(el) {
-      if (el < 1) return null;
-      const d = groundSlantRange(Math.max(el, 1));
-      const tanA = Math.tan(toRad(BEAM_HALF));
-      const b = d * tanA;
-      const a = b / Math.sin(toRad(Math.max(el, 1)));
-      return Math.PI * a * b;
+    // ─── Compute the maximum achievable availability with all GWs ───
+    // (used as the target for the minimum-GW set search)
+    const closableSamples = []; // indices of samples where some sat-GW combo closes
+    for (let i = 0; i < samples.length; i++) {
+      const s = samples[i];
+      let found = false;
+      for (const sat of s.satEls) {
+        if (sat.el < ka2517Min) break;
+        if ((s.gwViable[sat.idx] || []).length > 0) { found = true; break; }
+      }
+      if (found) closableSamples.push(i);
+    }
+    const maxAchievablePct = +(closableSamples.length / samples.length * 100).toFixed(1);
+
+    // ─── Greedy minimum gateway set cover ───
+    // Goal: smallest subset of active gateways such that the set of samples this
+    // subset can serve = closableSamples (the maximum achievable set).
+    // For each gateway, its "coverage set" = sample indices where any sat passing
+    // terminal threshold is also seen by THIS gateway at >= gwMin.
+    const gwCoverage = {}; // gwId -> Set of sample indices
+    for (const gw of activeGateways) {
+      const set = new Set();
+      for (let i = 0; i < samples.length; i++) {
+        const s = samples[i];
+        for (const sat of s.satEls) {
+          if (sat.el < ka2517Min) break;
+          const gwEl = elevAngle(gw.lat, gw.lon, sat.satLon);
+          if (gwEl >= gwMin) { set.add(i); break; }
+        }
+      }
+      gwCoverage[gw.id] = set;
     }
 
-    // ── Strategy S3: free-pick (optimal sat+gw at every step) ──
-    // For each sample, find the highest-EL sat that has at least one GW with
-    // bestGwEl >= gwMin; pick that GW.
+    // Greedy: at each step add the GW that covers the most uncovered samples.
+    const target = new Set(closableSamples);
+    const minSet = []; // ordered list of GWs in selection order
+    const covered = new Set();
+    while (covered.size < target.size) {
+      let bestGw = null, bestGain = 0;
+      for (const gw of activeGateways) {
+        if (minSet.find(g => g.id === gw.id)) continue;
+        let gain = 0;
+        for (const idx of gwCoverage[gw.id]) {
+          if (target.has(idx) && !covered.has(idx)) gain++;
+        }
+        if (gain > bestGain) { bestGain = gain; bestGw = gw; }
+      }
+      if (!bestGw) break; // can't make progress
+      minSet.push(bestGw);
+      for (const idx of gwCoverage[bestGw.id]) covered.add(idx);
+    }
+
+    if (minSet.length === 0) {
+      return { error: "No gateway can serve any portion of this flight" };
+    }
+
+    // ─── Build per-sample per-GW serving-options map for the selected set ───
+    // For each sample i, for each gw in minSet that covers i, list the sats this
+    // gw can serve (passing terminal threshold AND gw threshold).
+    function gwServiceAt(i, gw) {
+      // returns sorted array (desc by sat el) of {sat, gwEl} this gw can serve here
+      const out = [];
+      const s = samples[i];
+      for (const sat of s.satEls) {
+        if (sat.el < ka2517Min) break;
+        const gwEl = elevAngle(gw.lat, gw.lon, sat.satLon);
+        if (gwEl >= gwMin) out.push({ sat, gwEl });
+      }
+      return out;
+    }
+
+    // ─── Strategy S3: free pick (any GW, any sat) ───
     function runS3() {
       const out = [];
       let prevSat = -1, prevGw = null, satHo = 0, gwHo = 0;
-      for (const s of samples) {
+      for (let i = 0; i < samples.length; i++) {
+        const s = samples[i];
         let chosen = null;
         for (const sat of s.satEls) {
           if (sat.el < ka2517Min) break;
-          let bGw = null, bGwEl = -90;
-          for (const gw of activeGateways) {
-            const e = elevAngle(gw.lat, gw.lon, sat.satLon);
-            if (e > bGwEl) { bGwEl = e; bGw = gw; }
-          }
-          if (bGwEl >= gwMin && bGw) { chosen = { sat, gw: bGw, gwEl: bGwEl }; break; }
+          const list = s.gwViable[sat.idx] || [];
+          if (list.length > 0) { chosen = { sat, gw: list[0].gw, gwEl: list[0].gwEl }; break; }
         }
-        if (!chosen) {
-          out.push({ closed: true });
-          continue;
-        }
+        if (!chosen) { out.push({ closed: true }); continue; }
         if (prevSat >= 0 && chosen.sat.idx !== prevSat) satHo++;
         if (prevGw && chosen.gw.id !== prevGw) gwHo++;
-        prevSat = chosen.sat.idx;
-        prevGw  = chosen.gw.id;
-        out.push({ el: chosen.sat.el, area: footprintAreaKm2(chosen.sat.el), satIdx: chosen.sat.idx, gwId: chosen.gw.id, closed: false });
+        prevSat = chosen.sat.idx; prevGw = chosen.gw.id;
+        out.push({ closed: false, el: chosen.sat.el, area: footprintAreaKm2(chosen.sat.el),
+                   satIdx: chosen.sat.idx, gwId: chosen.gw.id });
       }
       return { samples: out, satHo, gwHo };
     }
 
-    // ── Strategy S2: single GW, opportunistic sat switching ──
-    // Lock to one gateway. Each step, pick the highest-EL sat that *this gateway*
-    // can see at >= gwMin. Use SAT_HYS to avoid jitter.
-    function runS2(gw) {
+    // ─── Strategy S2: minimum-GW set, sat switching allowed, hysteresis on GW ───
+    // Use minSet only. At each step, prefer current GW if it still serves something;
+    // otherwise switch to a GW from minSet that does.
+    function runS2() {
       const out = [];
-      let prevSat = -1, satHo = 0;
-      for (const s of samples) {
-        const viable = s.satEls.filter(sat => {
-          if (sat.el < ka2517Min) return false;
-          const ge = elevAngle(gw.lat, gw.lon, sat.satLon);
-          return ge >= gwMin;
-        });
-        if (viable.length === 0) {
-          out.push({ closed: true });
-          continue;
-        }
-        // Hysteresis: keep current sat if still viable and best alt isn't >SAT_HYS better
-        let chosen = viable[0];
-        const cur = viable.find(v => v.idx === prevSat);
-        if (cur && (viable[0].el - cur.el) < SAT_HYS) chosen = cur;
-        if (prevSat >= 0 && chosen.idx !== prevSat) satHo++;
-        prevSat = chosen.idx;
-        out.push({ el: chosen.el, area: footprintAreaKm2(chosen.el), satIdx: chosen.idx, gwId: gw.id, closed: false });
-      }
-      return { samples: out, satHo, gwHo: 0 };
-    }
-
-    // ── Strategy S1: single GW, sat locked until forced switch ──
-    // Stay on current sat until it drops out of GW LOS (or terminal scan).
-    function runS1(gw) {
-      const out = [];
-      let curSat = -1, satHo = 0;
-      for (const s of samples) {
-        // Is current sat still viable through this gateway?
+      let prevSat = -1, prevGwId = null, satHo = 0, gwHo = 0;
+      for (let i = 0; i < samples.length; i++) {
+        // Try current GW first
         let chosen = null;
-        if (curSat >= 0) {
-          const cur = s.satEls.find(x => x.idx === curSat);
-          if (cur && cur.el >= ka2517Min) {
-            const ge = elevAngle(gw.lat, gw.lon, cur.satLon);
-            if (ge >= gwMin) chosen = cur;
+        if (prevGwId) {
+          const curGw = minSet.find(g => g.id === prevGwId);
+          if (curGw) {
+            const svc = gwServiceAt(i, curGw);
+            if (svc.length > 0) {
+              // pick highest sat el this GW can serve, hysteresis on sat
+              let pick = svc[0];
+              const cur = svc.find(x => x.sat.idx === prevSat);
+              if (cur && (svc[0].sat.el - cur.sat.el) < SAT_HYS) pick = cur;
+              chosen = { sat: pick.sat, gw: curGw, gwEl: pick.gwEl };
+            }
           }
         }
+        // Forced GW switch — find a GW in minSet that can serve
         if (!chosen) {
-          // Forced switch: pick best available
-          for (const sat of s.satEls) {
-            if (sat.el < ka2517Min) break;
-            const ge = elevAngle(gw.lat, gw.lon, sat.satLon);
-            if (ge >= gwMin) { chosen = sat; break; }
-          }
-          if (chosen) {
-            if (curSat >= 0) satHo++;
-            curSat = chosen.idx;
+          for (const gw of minSet) {
+            if (gw.id === prevGwId) continue;
+            const svc = gwServiceAt(i, gw);
+            if (svc.length > 0) {
+              chosen = { sat: svc[0].sat, gw, gwEl: svc[0].gwEl };
+              break;
+            }
           }
         }
-        if (!chosen) {
-          out.push({ closed: true });
-          continue;
-        }
-        out.push({ el: chosen.el, area: footprintAreaKm2(chosen.el), satIdx: chosen.idx, gwId: gw.id, closed: false });
+        if (!chosen) { out.push({ closed: true }); continue; }
+        if (prevSat >= 0 && chosen.sat.idx !== prevSat) satHo++;
+        if (prevGwId && chosen.gw.id !== prevGwId) gwHo++;
+        prevSat = chosen.sat.idx; prevGwId = chosen.gw.id;
+        out.push({ closed: false, el: chosen.sat.el, area: footprintAreaKm2(chosen.sat.el),
+                   satIdx: chosen.sat.idx, gwId: chosen.gw.id });
       }
-      return { samples: out, satHo, gwHo: 0 };
+      return { samples: out, satHo, gwHo };
     }
 
-    // Auto-pick the best single GW for S1/S2 (option C):
-    // Score each GW by mean closed-sample splash on S1; pick the one with the lowest mean splash.
-    let bestGw = null, bestS1Score = Infinity, bestS1 = null;
-    const allS1Results = {};
-    for (const gw of activeGateways) {
-      const r = runS1(gw);
-      const closedSamples = r.samples.filter(x => !x.closed);
-      const meanArea = closedSamples.length
-        ? closedSamples.reduce((acc, x) => acc + x.area, 0) / closedSamples.length
-        : Infinity;
-      allS1Results[gw.id] = { meanArea, openCount: closedSamples.length, run: r };
-      if (meanArea < bestS1Score) { bestS1Score = meanArea; bestGw = gw; bestS1 = r; }
+    // ─── Strategy S1: minimum-GW set, sat AND GW locked until forced switch ───
+    // Stay on current sat until it's no longer serveable by current GW.
+    // Stay on current GW until it can't serve any sat. Then switch to another GW from minSet.
+    function runS1() {
+      const out = [];
+      let curSat = -1, curGwId = null, satHo = 0, gwHo = 0;
+      for (let i = 0; i < samples.length; i++) {
+        const s = samples[i];
+        let chosen = null;
+
+        // Try to keep current sat AND current GW
+        if (curGwId && curSat >= 0) {
+          const curGw = minSet.find(g => g.id === curGwId);
+          if (curGw) {
+            const sat = s.satEls.find(x => x.idx === curSat);
+            if (sat && sat.el >= ka2517Min) {
+              const gwEl = elevAngle(curGw.lat, curGw.lon, sat.satLon);
+              if (gwEl >= gwMin) chosen = { sat, gw: curGw, gwEl };
+            }
+          }
+        }
+
+        // Sat dropped but GW still works → switch sat (forced sat-switch only)
+        if (!chosen && curGwId) {
+          const curGw = minSet.find(g => g.id === curGwId);
+          if (curGw) {
+            const svc = gwServiceAt(i, curGw);
+            if (svc.length > 0) {
+              chosen = { sat: svc[0].sat, gw: curGw, gwEl: svc[0].gwEl };
+            }
+          }
+        }
+
+        // GW dropped too → forced GW handover; pick the GW from minSet with best sat
+        if (!chosen) {
+          let bestSet = null;
+          for (const gw of minSet) {
+            if (gw.id === curGwId) continue;
+            const svc = gwServiceAt(i, gw);
+            if (svc.length > 0 && (!bestSet || svc[0].sat.el > bestSet.sat.el)) {
+              bestSet = { sat: svc[0].sat, gw, gwEl: svc[0].gwEl };
+            }
+          }
+          if (bestSet) chosen = bestSet;
+        }
+
+        if (!chosen) { out.push({ closed: true }); continue; }
+        if (curSat >= 0 && chosen.sat.idx !== curSat) satHo++;
+        if (curGwId && chosen.gw.id !== curGwId) gwHo++;
+        curSat = chosen.sat.idx; curGwId = chosen.gw.id;
+        out.push({ closed: false, el: chosen.sat.el, area: footprintAreaKm2(chosen.sat.el),
+                   satIdx: chosen.sat.idx, gwId: chosen.gw.id });
+      }
+      return { samples: out, satHo, gwHo };
     }
-    if (!bestGw) return { error: "No gateway can serve any portion of this flight" };
-    const s2 = runS2(bestGw);
+
+    const s1 = runS1();
+    const s2 = runS2();
     const s3 = runS3();
 
-    // Compose chart data
-    // Stacked layout: y-bottom = S3 area, then S2 increment on top, then S1 increment on top.
-    // The visible thickness of each band == the *cost* of dropping to that strategy.
-    // Total stack height at any X = the S1 area for that sample.
+    // ─── Compose chart and summary ───
     const chart = [];
     let s1Sum = 0, s2Sum = 0, s3Sum = 0;
     let s1N = 0, s2N = 0, s3N = 0;
-    // Time-integrated area in km^2 * hours: sum(area * dt_hr), where dt_hr is per-sample width
-    const dt_hr = (durationSec / N) / 3600;
     let s1AreaTime = 0, s2AreaTime = 0, s3AreaTime = 0;
 
     for (let i = 0; i <= N; i++) {
       const f = i / N;
       const pct = +(f * 100).toFixed(1);
-      const sa = bestS1.samples[i];
+      const sa = s1.samples[i];
       const sb = s2.samples[i];
       const sc = s3.samples[i];
       const aS = sa.closed ? null : sa.area;
       const bS = sb.closed ? null : sb.area;
       const cS = sc.closed ? null : sc.area;
-      // Stack increments. Note S3 <= S2 <= S1 by construction.
       let s3Layer = null, s2Inc = null, s1Inc = null;
       if (cS !== null) s3Layer = cS;
       if (bS !== null) s2Inc   = (cS !== null) ? Math.max(0, bS - cS) : bS;
       if (aS !== null) s1Inc   = (bS !== null) ? Math.max(0, aS - bS) : (cS !== null ? Math.max(0, aS - cS) : aS);
       chart.push({
         pct,
-        s3Base: s3Layer,    // bottom layer (green)
-        s2Inc:  s2Inc,      // cost of locking GW (allow sat switches)
-        s1Inc:  s1Inc,      // cost of locking sat too (on top of S2)
+        s3Base: s3Layer, s2Inc, s1Inc,
         s1Total: aS, s2Total: bS, s3Total: cS,
         s1Closed: sa.closed, s2Closed: sb.closed, s3Closed: sc.closed,
-        // Helpers for tooltip display: km^2 in pretty format
       });
       if (aS !== null) { s1Sum += aS; s1N++; s1AreaTime += aS * dt_hr; }
       if (bS !== null) { s2Sum += bS; s2N++; s2AreaTime += bS * dt_hr; }
@@ -4828,22 +4918,40 @@ export default function O3bSimulator() {
     }
     const tot = N + 1;
 
+    // ─── Compute per-GW contribution within the minimum set (S2 strategy) ───
+    // For each gw in minSet, count how many S2 samples it served
+    const gwUsage = {};
+    for (const gw of minSet) gwUsage[gw.id] = 0;
+    for (const sample of s2.samples) {
+      if (!sample.closed && gwUsage[sample.gwId] !== undefined) gwUsage[sample.gwId]++;
+    }
+    const minSetMembers = minSet.map(gw => ({
+      id: gw.id,
+      name: gw.name,
+      country: gw.country,
+      serveCount: gwUsage[gw.id],
+      servePct: +(gwUsage[gw.id] / tot * 100).toFixed(1),
+    }));
+
     return {
       chart,
-      bestGw,
       durationHours: +(durationSec / 3600).toFixed(2),
       beamHalfDeg: BEAM_HALF,
-      // Per-strategy summary: mean instantaneous area + total area-time (resource consumption)
+      maxAchievablePct,
+      // Minimum-GW set info
+      minSet: minSetMembers,
+      activeGwCount: activeGateways.length,
+      // Per-strategy summary
       s1: {
         meanArea:   s1N ? s1Sum / s1N : null,
-        totalAreaH: s1AreaTime,                 // km^2 * hours
-        satHo: bestS1.satHo, gwHo: 0,
+        totalAreaH: s1AreaTime,
+        satHo: s1.satHo, gwHo: s1.gwHo,
         availPct: +(s1N / tot * 100).toFixed(1),
       },
       s2: {
         meanArea:   s2N ? s2Sum / s2N : null,
         totalAreaH: s2AreaTime,
-        satHo: s2.satHo, gwHo: 0,
+        satHo: s2.satHo, gwHo: s2.gwHo,
         availPct: +(s2N / tot * 100).toFixed(1),
       },
       s3: {
@@ -4852,22 +4960,6 @@ export default function O3bSimulator() {
         satHo: s3.satHo, gwHo: s3.gwHo,
         availPct: +(s3N / tot * 100).toFixed(1),
       },
-      // Per-GW S1 breakdown using area now
-      gwScores: Object.entries(allS1Results).map(([id, r]) => {
-        const closed = r.run.samples.filter(x => !x.closed);
-        const meanArea = closed.length
-          ? closed.reduce((acc, x) => acc + x.area, 0) / closed.length
-          : null;
-        const totalAreaH = closed.length
-          ? closed.reduce((acc, x) => acc + x.area * dt_hr, 0)
-          : 0;
-        return {
-          id,
-          name: activeGateways.find(g => g.id === id)?.name || id,
-          meanArea, totalAreaH,
-          availPct: +(r.openCount / tot * 100).toFixed(1),
-        };
-      }).sort((a, b) => (a.meanArea || Infinity) - (b.meanArea || Infinity)),
     };
   }, [tab, flightMode, flightOrigin, flightDest, flightStartTime, numSats, activeGateways, gwMinEl, ka2517MinEl, realFlightTrack, strategyBeamHalf]);
 
@@ -7517,12 +7609,14 @@ export default function O3bSimulator() {
             ) : (
               <div>
                 {/* Header / context */}
-                <div style={{marginBottom:"10px",padding:"8px 12px",background:"#080f1a",border:"1px solid #1e3055",borderRadius:"3px"}}>
-                  <div style={{display:"flex",alignItems:"center",gap:"14px",flexWrap:"wrap",fontSize:"11px"}}>
+                <div style={{marginBottom:"10px",padding:"10px 12px",background:"#080f1a",border:"1px solid #1e3055",borderRadius:"3px"}}>
+                  <div style={{display:"flex",alignItems:"center",gap:"14px",flexWrap:"wrap",fontSize:"11px",marginBottom:"6px"}}>
                     <span style={{color:"#00cfff",fontWeight:"bold",letterSpacing:"0.05em"}}>STRATEGY COMPARISON</span>
-                    <span style={{color:"#4a6a8a"}}>Best single GW for this route:</span>
-                    <span style={{color:"#ff9900",fontWeight:"bold"}}>{strategyData.bestGw.id} ({strategyData.bestGw.name})</span>
                     <span style={{color:"#4a6a8a"}}>{strategyData.durationHours}h flight, {numSats} sats</span>
+                    <span style={{color:"#4a6a8a"}}>Max achievable availability:</span>
+                    <span style={{color:strategyData.maxAchievablePct>=99?"#00ff88":strategyData.maxAchievablePct>=90?"#ffd700":"#ff6b35",fontWeight:"bold"}}>
+                      {strategyData.maxAchievablePct}%
+                    </span>
                     {/* Beam half-width control */}
                     <span style={{flex:1}}/>
                     <label style={{color:"#8ab0d0",fontSize:"11px",display:"flex",alignItems:"center",gap:"5px"}}>
@@ -7533,11 +7627,24 @@ export default function O3bSimulator() {
                       <span style={{color:"#4a6a8a",fontSize:"10px"}}>deg</span>
                     </label>
                   </div>
-                  <div style={{color:"#5a7a9a",fontSize:"10px",marginTop:"5px",lineHeight:"1.4"}}>
+                  <div style={{display:"flex",alignItems:"center",gap:"8px",flexWrap:"wrap",fontSize:"11px",marginBottom:"6px"}}>
+                    <span style={{color:"#4a6a8a"}}>Min GW set ({strategyData.minSet.length} of {strategyData.activeGwCount} active):</span>
+                    {strategyData.minSet.map((gw, i) => (
+                      <span key={gw.id} style={{display:"inline-flex",alignItems:"center",gap:"4px",
+                        background:"#1a1408",border:"1px solid #ff9900",borderRadius:"3px",padding:"2px 8px"}}>
+                        <span style={{color:"#ff9900",fontWeight:"bold"}}>{gw.id}</span>
+                        <span style={{color:"#8ab0d0",fontSize:"10px"}}>{gw.name}</span>
+                        <span style={{color:"#5a7a9a",fontSize:"10px"}}>· {gw.servePct}%</span>
+                      </span>
+                    ))}
+                  </div>
+                  <div style={{color:"#5a7a9a",fontSize:"10px",marginTop:"4px",lineHeight:"1.4"}}>
+                    <strong>Apples-to-apples comparison:</strong> S1 and S2 use the minimum gateway set above (greedily chosen
+                    to match S3's coverage), so all three strategies achieve the same availability ({strategyData.maxAchievablePct}%).
+                    Differences in mean area / total area·hours are pure efficiency differences, not coverage gaps.
+                    <br/>
                     <strong>Footprint area</strong> (km²) = pi · a · b, where a = b/sin(EL) is the along-track semi-axis.
-                    Lower elevation angles inflate the footprint dramatically. The stack chart below shows total
-                    instantaneous area by strategy; the colored bands above the green base are the *cost* of switching
-                    to that simpler strategy.
+                    Lower elevation angles inflate the footprint dramatically.
                   </div>
                 </div>
 
@@ -7545,8 +7652,8 @@ export default function O3bSimulator() {
                 <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:"8px",marginBottom:"12px"}}>
                   {[
                     { key:"s3", label:"S3 — FREE PICK",         color:"#00ff88", desc:"Optimal sat+GW at every step" },
-                    { key:"s2", label:"S2 — SINGLE GW",         color:"#7fff00", desc:"One GW, switch sats opportunistically" },
-                    { key:"s1", label:"S1 — SINGLE GW + LOCK",  color:"#ffd700", desc:"One GW, sat locked until forced switch" },
+                    { key:"s2", label:"S2 — MIN-GW SET",        color:"#7fff00", desc:"Min GW set, sat switching, GW handover only when forced" },
+                    { key:"s1", label:"S1 — MIN-GW SET + LOCK", color:"#ffd700", desc:"Min GW set, sat AND GW locked until forced switch" },
                   ].map(card => {
                     const d = strategyData[card.key];
                     const baseline = strategyData.s3;
@@ -7627,49 +7734,41 @@ export default function O3bSimulator() {
                   </ResponsiveContainer>
                 </div>
 
-                {/* Per-gateway S1 score table - now using area */}
+                {/* Min-GW set members + their service share (S2 strategy usage) */}
                 <div style={{color:"#4a6a8a",fontSize:"10px",marginTop:"14px",marginBottom:"6px",letterSpacing:"0.05em"}}>
-                  SINGLE-GATEWAY CANDIDATES (S1 baseline — sorted by mean footprint area)
+                  MIN-GW SET MEMBERS — {strategyData.minSet.length} of {strategyData.activeGwCount} active GWs · serving share under S2 strategy
                 </div>
-                <div style={{background:"#080f1a",border:"1px solid #2e4270",borderRadius:"3px",padding:"10px"}}>
-                  <div style={{display:"grid",gridTemplateColumns:"50px 1fr 110px 110px 80px 90px",gap:"8px",
+                <div style={{background:"#080f1a",border:"1px solid #ff990044",borderRadius:"3px",padding:"10px"}}>
+                  <div style={{display:"grid",gridTemplateColumns:"40px 1fr 110px 1fr",gap:"8px",
                     padding:"3px 0",borderBottom:"1px solid #2e4270",marginBottom:"3px",
                     color:"#4a6a8a",fontSize:"9px",letterSpacing:"0.05em"}}>
-                    <span>RANK</span><span>GATEWAY</span>
-                    <span style={{textAlign:"right"}}>MEAN AREA</span>
-                    <span style={{textAlign:"right"}}>TOTAL AREA·H</span>
-                    <span style={{textAlign:"right"}}>AVAIL</span>
-                    <span style={{textAlign:"right"}}>vs BEST</span>
+                    <span>#</span><span>GATEWAY</span>
+                    <span style={{textAlign:"right"}}>SERVE %</span>
+                    <span></span>
                   </div>
-                  {strategyData.gwScores.map((g, i) => {
-                    const isBest = g.id === strategyData.bestGw.id;
-                    const bestArea = strategyData.gwScores[0].meanArea;
-                    const delta = (g.meanArea !== null && bestArea !== null) ? g.meanArea - bestArea : null;
-                    const fmt = v => v == null ? "—" : v >= 1e6 ? `${(v/1e6).toFixed(2)} M` : v >= 1e3 ? `${(v/1e3).toFixed(1)} k` : `${v.toFixed(0)}`;
+                  {strategyData.minSet.map((g, i) => {
                     return (
-                      <div key={g.id} style={{display:"grid",gridTemplateColumns:"50px 1fr 110px 110px 80px 90px",gap:"8px",
-                        padding:"3px 0",borderBottom:"1px solid #152030",alignItems:"center",fontSize:"11px"}}>
-                        <span style={{color:isBest?"#ff9900":"#4a6a8a",fontWeight:isBest?"bold":"normal"}}>
-                          {isBest?"★ ":"  "}{i+1}
+                      <div key={g.id} style={{display:"grid",gridTemplateColumns:"40px 1fr 110px 1fr",gap:"8px",
+                        padding:"4px 0",borderBottom:"1px solid #152030",alignItems:"center",fontSize:"11px"}}>
+                        <span style={{color:"#ff9900",fontWeight:"bold"}}>{i+1}</span>
+                        <span style={{color:"#ff9900",fontWeight:"bold"}}>
+                          {g.id} <span style={{color:"#8ab0d0",fontWeight:"normal"}}>{g.name}</span>
+                          <span style={{color:"#5a7a9a"}}> · {g.country}</span>
                         </span>
-                        <span style={{color:isBest?"#ff9900":"#8ab0d0",fontWeight:isBest?"bold":"normal"}}>
-                          {g.id} <span style={{color:"#5a7a9a"}}>{g.name}</span>
+                        <span style={{color:"#c0d8f0",textAlign:"right",fontWeight:"bold"}}>
+                          {g.servePct}%
                         </span>
-                        <span style={{color:"#c0d8f0",textAlign:"right"}}>
-                          {fmt(g.meanArea)} km²
-                        </span>
-                        <span style={{color:"#c0d8f0",textAlign:"right"}}>
-                          {g.totalAreaH ? `${g.totalAreaH.toFixed(0)} km²·h` : "—"}
-                        </span>
-                        <span style={{color:g.availPct >= 95 ? "#00ff88" : g.availPct >= 70 ? "#ffd700" : "#ff6b35",textAlign:"right"}}>
-                          {g.availPct}%
-                        </span>
-                        <span style={{color:"#5a7a9a",textAlign:"right",fontSize:"10px"}}>
-                          {delta == null ? "—" : delta === 0 ? "★" : `+${fmt(delta)} km²`}
-                        </span>
+                        <div style={{height:"6px",background:"#152030",borderRadius:"3px",overflow:"hidden"}}>
+                          <div style={{width:`${g.servePct}%`,height:"100%",background:"#ff9900",borderRadius:"3px"}}/>
+                        </div>
                       </div>
                     );
                   })}
+                  <div style={{color:"#5a7a9a",fontSize:"10px",lineHeight:"1.4",marginTop:"8px",paddingTop:"6px",borderTop:"1px dashed #2e4270"}}>
+                    Greedy set cover: chosen so that at every closable sample, at least one of these gateways
+                    can serve. Their union matches S3's coverage. The percentage is the fraction of total flight
+                    samples each gateway actively served under the S2 strategy (with hysteresis).
+                  </div>
                 </div>
               </div>
             )}
