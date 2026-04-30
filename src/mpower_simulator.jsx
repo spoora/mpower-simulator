@@ -8,7 +8,7 @@ import {
 // ═══════════════════════════════════════════════════════════════
 // ORBITAL CONSTANTS — O3b mPOWER
 // ═══════════════════════════════════════════════════════════════
-const VERSION = "v4.13.0";
+const VERSION = "v4.13.1";
 const Re     = 6371;
 const h_orb  = 8063;
 const Rs     = Re + h_orb;
@@ -1328,11 +1328,18 @@ function BeamProjectionTab({ simTime, numSats, satNames, gpLat, gpLon, flightAct
     // Draw all active gateways as orange squares; the active one is highlighted.
     const gws = activeGateways || [];
     if (gws.length > 0) {
+      const gwMinForLabels = gwMinEl ?? 10;
+      // For each GW, compute its elevation to the active satellite (if any).
+      // This is what drives the active-link decision; showing it next to each
+      // GW marker makes the math verifiable at a glance.
+      const activeSatLon = activeLink && activeLink.sat ? activeLink.sat.satLon : null;
       ctx.save();
       for (const gw of gws) {
         const pG = proj([gw.lon, gw.lat]);
         if (!pG) continue;
         const isActive = activeLink && activeLink.gw && activeLink.gw.id === gw.id;
+        const gwElToActiveSat = activeSatLon !== null ? elevAngle(gw.lat, gw.lon, activeSatLon) : null;
+        const sees = gwElToActiveSat !== null && gwElToActiveSat >= gwMinForLabels;
         const sz = isActive ? 6 : 4;
         ctx.beginPath();
         ctx.rect(pG[0] - sz, pG[1] - sz, sz * 2, sz * 2);
@@ -1340,23 +1347,40 @@ function BeamProjectionTab({ simTime, numSats, satNames, gpLat, gpLon, flightAct
           ctx.fillStyle = "#ff9900cc";
           ctx.strokeStyle = "#ff9900";
           ctx.lineWidth = 2;
-          // Pulsing glow
           ctx.shadowColor = "#ff9900";
           ctx.shadowBlur = 12;
-        } else {
+        } else if (sees) {
+          // GW that CAN see active sat (but didn't get picked) — outline in dim green
           ctx.fillStyle = "#ff990044";
-          ctx.strokeStyle = "#ff990088";
+          ctx.strokeStyle = "#7fff00aa";
+          ctx.lineWidth = 1.2;
+        } else {
+          ctx.fillStyle = "#ff990022";
+          ctx.strokeStyle = "#ff990066";
           ctx.lineWidth = 1;
         }
         ctx.fill();
         ctx.stroke();
         ctx.shadowBlur = 0;
-        // Label
+
+        // ID label
         ctx.fillStyle = isActive ? "#ff9900" : "#ff990088";
         ctx.font = isActive ? "bold 9px 'Courier New'" : "8px 'Courier New'";
         ctx.textAlign = "left";
         ctx.shadowColor = "rgba(0,0,0,0.9)"; ctx.shadowBlur = 3;
         ctx.fillText(gw.id, pG[0] + sz + 3, pG[1] + 3);
+
+        // Elevation-to-active-sat label (only if there is an active sat)
+        if (gwElToActiveSat !== null) {
+          const elTxt = gwElToActiveSat < -10
+            ? "below horizon"
+            : gwElToActiveSat.toFixed(1) + "deg";
+          ctx.font = "7px 'Courier New'";
+          ctx.fillStyle = isActive
+            ? "#ffd700"
+            : (sees ? "#7fff00cc" : "#ff6b35aa");
+          ctx.fillText(elTxt, pG[0] + sz + 3, pG[1] + 12);
+        }
         ctx.shadowBlur = 0;
       }
       ctx.restore();
@@ -1834,6 +1858,39 @@ function BeamProjectionTab({ simTime, numSats, satNames, gpLat, gpLon, flightAct
                   border:`1px solid ${activeLink.fallback?"#ffd70044":"#00ff8844"}`,borderRadius:"3px",padding:"5px 7px"}}>
                   {activeLink.fallback ? "[!] " : "[OK] "}{activeLink.reason}
                 </div>
+                {/* GW elevation audit: lists every active GW's EL to the active sat, ranked.
+                    Lets the user verify that the chosen GW really has the highest visibility
+                    above gwMinEl and that no other GW was ignored. */}
+                {activeGateways && activeGateways.length > 0 && (
+                  <div style={{marginTop:"8px"}}>
+                    <div style={{color:"#4a6a8a",fontSize:"9px",letterSpacing:"0.05em",marginBottom:"3px"}}>
+                      GW ELEVATIONS TO {activeLink.sat.name} (gwMin = {gwMinEl ?? 10}deg)
+                    </div>
+                    <div style={{background:"#080f1a",border:"1px solid #1e3055",borderRadius:"3px",padding:"5px 7px",
+                      maxHeight:"140px",overflowY:"auto"}}>
+                      {[...activeGateways]
+                        .map(gw => ({ gw, el: elevAngle(gw.lat, gw.lon, activeLink.sat.satLon) }))
+                        .sort((a, b) => b.el - a.el)
+                        .map(({ gw, el }) => {
+                          const sees = el >= (gwMinEl ?? 10);
+                          const isChosen = activeLink.gw.id === gw.id;
+                          return (
+                            <div key={gw.id} style={{display:"grid",gridTemplateColumns:"16px 90px 60px 1fr",
+                              gap:"6px",fontSize:"9px",alignItems:"center",padding:"1px 0"}}>
+                              <span style={{color:isChosen?"#ff9900":"#3a5a7a",fontWeight:isChosen?"bold":"normal"}}>
+                                {isChosen ? "★" : (sees ? "✓" : "·")}
+                              </span>
+                              <span style={{color:isChosen?"#ff9900":(sees?"#8ab0d0":"#5a7a9a")}}>{gw.id}</span>
+                              <span style={{color:sees?"#7fff00":"#ff6b35",textAlign:"right"}}>
+                                {el < -10 ? "—" : el.toFixed(1) + "deg"}
+                              </span>
+                              <span style={{color:"#5a7a9a",fontSize:"8px"}}>{gw.name}</span>
+                            </div>
+                          );
+                        })}
+                    </div>
+                  </div>
+                )}
               </div>
             )}
           </div>
