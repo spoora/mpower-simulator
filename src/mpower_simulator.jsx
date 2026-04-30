@@ -8,7 +8,7 @@ import {
 // ═══════════════════════════════════════════════════════════════
 // ORBITAL CONSTANTS — O3b mPOWER
 // ═══════════════════════════════════════════════════════════════
-const VERSION = "v4.10.0";
+const VERSION = "v4.10.1";
 const Re     = 6371;
 const h_orb  = 8063;
 const Rs     = Re + h_orb;
@@ -1159,27 +1159,67 @@ function BeamProjectionTab({ simTime, numSats, satNames, gpLat, gpLon, flightAct
     }
 
     if (showPassRegion) {
-      const sats = selSat === -1 ? inViewSats : inViewSats.filter(function(s) { return s.idx === selSat; });
-      for (const sat of sats) {
-        const { lo, hi } = getPassWindow(sat.idx);
-        const nSteps = 40;
-        const elR = toRad(elThresh);
-        const nadirAngle = Math.asin((Re / Rs) * Math.cos(elR));
-        const centralAngle = Math.PI / 2 - elR - nadirAngle;
-        const ringKm = Re * centralAngle;
-        const upperPts = [], lowerPts = [];
+      // Pass region is now tied to the ACTIVE LINK: only the satellite currently
+      // serving the terminal, and only the portion of its pass during which the
+      // active gateway also sees the satellite at >= gwMinEl. The result is
+      // the *end-to-end* footprint — where the terminal can be while keeping the
+      // link closed via the currently-serving gateway.
+      const gwMin    = gwMinEl ?? 10;
+      const ka2517Min = ka2517MinEl ?? 20;
+      // If user has selected a specific sat, honour that (override active link)
+      // Otherwise use the active link's serving satellite.
+      let satsToDraw;
+      if (selSat !== -1) {
+        const matching = inViewSats.filter(s => s.idx === selSat);
+        satsToDraw = matching.map(s => ({ ...s, gw: activeLink && activeLink.gw && activeLink.sat && activeLink.sat.idx === s.idx ? activeLink.gw : null }));
+      } else if (activeLink && activeLink.sat && activeLink.gw) {
+        satsToDraw = [{ idx: activeLink.sat.idx, gw: activeLink.gw }];
+      } else {
+        satsToDraw = []; // no active link => no end-to-end region to draw
+      }
+      const elR = toRad(elThresh);
+      const nadirAngle = Math.asin((Re / Rs) * Math.cos(elR));
+      const centralAngle = Math.PI / 2 - elR - nadirAngle;
+      const ringKm = Re * centralAngle;
+
+      for (const drawSat of satsToDraw) {
+        const { lo, hi } = getPassWindow(drawSat.idx);
+        const nSteps = 80;
+        const gw = drawSat.gw;
+        // Walk the pass window. For each step record whether the gateway can see
+        // the satellite at >= gwMin. Build polygon segments per contiguous run
+        // of "gateway closed" samples — so the envelope becomes a set of pieces
+        // whenever the gateway loses LOS during the pass.
+        const segments = []; // each: { upper:[], lower:[] }
+        let cur = null;
         for (let i = 0; i <= nSteps; i++) {
           const t  = lo + (i / nSteps) * (hi - lo);
-          const sl = satLon(sat.idx, t, numSats);
-          upperPts.push(geodesicDestPt(0, sl, 0, ringKm));
-          lowerPts.push(geodesicDestPt(0, sl, 180, ringKm));
+          const sl = satLon(drawSat.idx, t, numSats);
+          let gwOk;
+          if (gw) {
+            const gwEl = elevAngle(gw.lat, gw.lon, sl);
+            gwOk = gwEl >= gwMin;
+          } else {
+            gwOk = false;
+          }
+          if (gwOk) {
+            if (!cur) { cur = { upper: [], lower: [] }; segments.push(cur); }
+            cur.upper.push(geodesicDestPt(0, sl, 0, ringKm));
+            cur.lower.push(geodesicDestPt(0, sl, 180, ringKm));
+          } else {
+            cur = null;
+          }
         }
-        const allPts = upperPts.concat(lowerPts.slice().reverse()).concat([upperPts[0]]);
-        ctx.beginPath();
-        path({ type:"Feature", geometry:{ type:"Polygon", coordinates:[allPts] } });
-        ctx.strokeStyle = "#ff8800cc"; ctx.lineWidth = 1.8;
-        ctx.fillStyle = "#ff880012";
-        ctx.fill(); ctx.stroke();
+        // Render each viable segment as its own filled polygon
+        for (const seg of segments) {
+          if (seg.upper.length < 2) continue;
+          const allPts = seg.upper.concat(seg.lower.slice().reverse()).concat([seg.upper[0]]);
+          ctx.beginPath();
+          path({ type:"Feature", geometry:{ type:"Polygon", coordinates:[allPts] } });
+          ctx.strokeStyle = "#ff8800cc"; ctx.lineWidth = 1.8;
+          ctx.fillStyle = "#ff880012";
+          ctx.fill(); ctx.stroke();
+        }
       }
     }
 
@@ -1558,7 +1598,7 @@ function BeamProjectionTab({ simTime, numSats, satNames, gpLat, gpLon, flightAct
             <div style={{display:"flex",flexDirection:"column",gap:"6px"}}>
               {[
                 ["Is gateway",        isGateway,      setIsGateway],
-                ["Show pass region",  showPassRegion, setShowPassRegion],
+                ["Show end-to-end pass region", showPassRegion, setShowPassRegion],
                 ["Show dual illumination", showDualIllum, setShowDualIllum],
               ].map(function(row) {
                 return (
@@ -1571,6 +1611,20 @@ function BeamProjectionTab({ simTime, numSats, satNames, gpLat, gpLon, flightAct
                   </label>
                 );
               })}
+              {showPassRegion && (
+                <div style={{color:"#5a7a9a",fontSize:"9px",lineHeight:"1.4",
+                  background:"#080f1a",border:"1px solid #1e3055",borderRadius:"3px",padding:"5px 7px",marginTop:"2px"}}>
+                  Orange envelope = ground area where the terminal can keep the link closed via{" "}
+                  <span style={{color:"#ff9900",fontWeight:"bold"}}>
+                    {activeLink && activeLink.gw ? activeLink.gw.id : "the active gateway"}
+                  </span>{" "}
+                  during the pass of{" "}
+                  <span style={{color: activeLink && activeLink.sat ? SAT_COLORS[activeLink.sat.idx % SAT_COLORS.length] : "#7fff00", fontWeight:"bold"}}>
+                    {activeLink && activeLink.sat ? activeLink.sat.name : "the serving satellite"}
+                  </span>.
+                  Gaps occur when the gateway loses LOS to the satellite.
+                </div>
+              )}
               <div style={{display:"flex",alignItems:"center",gap:"6px",flexWrap:"wrap"}}>
                 <label style={{color:"#8ab0d0",fontSize:"10px",cursor:"pointer",
                   display:"flex",alignItems:"center",gap:"5px",userSelect:"none"}}>
@@ -1590,7 +1644,7 @@ function BeamProjectionTab({ simTime, numSats, satNames, gpLat, gpLon, flightAct
           </div>
 
           <div style={panelStyle}>
-            <div style={secStyle}>PASS REGION</div>
+            <div style={secStyle}>PASS REGION (END-TO-END)</div>
             {inViewSats.length > 0 ? (selSat===-1?inViewSats.slice(0,2):inViewSats.filter(function(s){return s.idx===selSat;})).map(function(sat) {
               const pw = getPassWindow(sat.idx);
               const slLo = satLon(sat.idx, pw.lo, numSats);
