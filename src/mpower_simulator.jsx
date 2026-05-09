@@ -8,7 +8,7 @@ import {
 // ═══════════════════════════════════════════════════════════════
 // ORBITAL CONSTANTS — O3b mPOWER
 // ═══════════════════════════════════════════════════════════════
-const VERSION = "v4.21.2";
+const VERSION = "v4.21.3";
 const Re     = 6371;
 const h_orb  = 8063;
 const Rs     = Re + h_orb;
@@ -6302,17 +6302,41 @@ export default function O3bSimulator() {
       // Use middle-of-flight time for the tracks call
       const midTime = Math.floor((flight.firstSeen + flight.lastSeen) / 2);
       const url = `${OPENSKY_PROXY}/api/tracks/all?icao24=${encodeURIComponent(flight.icao24)}&time=${midTime}`;
-      const res = await fetch(url);
-      if (!res.ok) {
-        if (res.status === 404) {
-          throw new Error("No ADS-B track recorded for this flight (gap in coverage).");
+      // Session cache: re-selecting the same flight in this session is free
+      // (no OpenSky hit). Key is deterministic from icao24 + midTime, which is
+      // derived from firstSeen/lastSeen and is therefore stable per flight.
+      const cacheKey = `opensky-track:${flight.icao24}:${midTime}`;
+      let text = null;
+      try {
+        if (typeof sessionStorage !== "undefined") {
+          text = sessionStorage.getItem(cacheKey);
         }
-        if (res.status === 403) {
-          throw new Error("OpenSky rate-limited or auth issue (HTTP 403). Try again later.");
+      } catch { /* sessionStorage may be unavailable in some sandboxes */ }
+      if (text === null) {
+        const res = await fetch(url);
+        if (!res.ok) {
+          if (res.status === 404) {
+            throw new Error("No ADS-B track recorded for this flight (gap in coverage).");
+          }
+          if (res.status === 403) {
+            throw new Error("OpenSky rate-limited or auth issue (HTTP 403). Try again later.");
+          }
+          if (res.status === 429) {
+            throw new Error("OpenSky rate limit hit (HTTP 429). Wait ~1 minute and retry, or pick a flight you've already loaded (cached).");
+          }
+          if (res.status >= 500) {
+            throw new Error(`OpenSky service error (HTTP ${res.status}). Try again in a moment.`);
+          }
+          throw new Error(`HTTP ${res.status}`);
         }
-        throw new Error(`HTTP ${res.status}`);
+        text = await res.text();
+        // Cache the raw response so re-clicks bypass the network entirely.
+        try {
+          if (typeof sessionStorage !== "undefined") {
+            sessionStorage.setItem(cacheKey, text);
+          }
+        } catch { /* quota exceeded or storage disabled — non-fatal */ }
       }
-      const text = await res.text();
       let data;
       try { data = JSON.parse(text); } catch { throw new Error("Invalid JSON track response"); }
       if (!data || !Array.isArray(data.path) || data.path.length < 2) {
