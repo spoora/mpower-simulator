@@ -8,7 +8,7 @@ import {
 // ═══════════════════════════════════════════════════════════════
 // ORBITAL CONSTANTS — O3b mPOWER
 // ═══════════════════════════════════════════════════════════════
-const VERSION = "v4.17.0";
+const VERSION = "v4.19.2";
 const Re     = 6371;
 const h_orb  = 8063;
 const Rs     = Re + h_orb;
@@ -2793,55 +2793,76 @@ function bwRequiredMhz(cirMbps, cnDb) {
 }
 
 // ─── KA2517 + mPower efficiency lookup grid ───────────────────
-// Empirical efficiencies and bandwidth requirements at reference
-// latitudes. Snap-to-nearest by latitude; covers ±40° in 2.5° steps.
-// Latitude → spectral efficiency (bits/Hz). Snap-to-nearest by latitude;
-// covers ±40° in 2.5° steps. MHz needed = Mbps / efficiency, computed at runtime.
+// ─── KA2517 + mPower efficiency lookup grid ───────────────────
+// Empirical efficiencies at each latitude. Edge-of-pass and
+// center-of-pass efficiencies are listed; runtime interpolates
+// based on current elevation so MHz cost reflects geometry.
+// Snap-to-nearest by latitude; covers ±40° in 2.5° steps.
 const KA2517_EFFICIENCY_GRID = [
-  { lat: 40.0, elEdge: 16.7, elCenter: 27.0, effFwd:0.307, effRtn:1.047 },
-  { lat: 37.5, elEdge: 18.7, elCenter: 30.6, effFwd:0.394, effRtn:1.110 },
-  { lat: 35.0, elEdge: 20.7, elCenter: 34.2, effFwd:0.482, effRtn:1.173 },
-  { lat: 32.5, elEdge: 22.7, elCenter: 37.8, effFwd:0.569, effRtn:1.237 },
-  { lat: 30.0, elEdge: 24.7, elCenter: 41.4, effFwd:0.657, effRtn:1.300 },
-  { lat: 27.5, elEdge: 26.7, elCenter: 44.9, effFwd:0.744, effRtn:1.363 },
-  { lat: 25.0, elEdge: 28.7, elCenter: 48.5, effFwd:0.832, effRtn:1.427 },
-  { lat: 22.5, elEdge: 30.7, elCenter: 52.1, effFwd:0.907, effRtn:1.483 },
-  { lat: 20.0, elEdge: 32.7, elCenter: 55.7, effFwd:0.983, effRtn:1.540 },
-  { lat: 17.5, elEdge: 33.6, elCenter: 60.0, effFwd:1.025, effRtn:1.565 },
-  { lat: 15.0, elEdge: 34.6, elCenter: 64.3, effFwd:1.066, effRtn:1.589 },
-  { lat: 12.5, elEdge: 35.5, elCenter: 68.6, effFwd:1.107, effRtn:1.614 },
-  { lat: 10.0, elEdge: 36.5, elCenter: 72.8, effFwd:1.148, effRtn:1.638 },
-  { lat:  7.5, elEdge: 37.5, elCenter: 77.1, effFwd:1.195, effRtn:1.652 },
-  { lat:  5.0, elEdge: 38.4, elCenter: 81.4, effFwd:1.241, effRtn:1.666 },
-  { lat:  2.5, elEdge: 39.4, elCenter: 85.7, effFwd:1.287, effRtn:1.680 },
-  { lat:  0.0, elEdge: 40.3, elCenter: 90.0, effFwd:1.333, effRtn:1.693 },
-  { lat: -2.5, elEdge: 39.4, elCenter: 85.7, effFwd:1.287, effRtn:1.680 },
-  { lat: -5.0, elEdge: 38.4, elCenter: 81.4, effFwd:1.241, effRtn:1.666 },
-  { lat: -7.5, elEdge: 37.5, elCenter: 77.1, effFwd:1.222, effRtn:1.652 },
-  { lat:-10.0, elEdge: 36.5, elCenter: 72.8, effFwd:1.203, effRtn:1.638 },
-  { lat:-12.5, elEdge: 35.5, elCenter: 68.6, effFwd:1.135, effRtn:1.614 },
-  { lat:-15.0, elEdge: 34.6, elCenter: 64.3, effFwd:1.066, effRtn:1.589 },
-  { lat:-17.5, elEdge: 33.6, elCenter: 60.0, effFwd:1.025, effRtn:1.565 },
-  { lat:-20.0, elEdge: 32.7, elCenter: 55.7, effFwd:0.983, effRtn:1.540 },
-  { lat:-22.5, elEdge: 30.7, elCenter: 52.1, effFwd:0.907, effRtn:1.483 },
-  { lat:-25.0, elEdge: 28.7, elCenter: 48.5, effFwd:0.832, effRtn:1.427 },
-  { lat:-27.5, elEdge: 26.7, elCenter: 44.9, effFwd:0.744, effRtn:1.363 },
-  { lat:-30.0, elEdge: 24.7, elCenter: 41.4, effFwd:0.657, effRtn:1.300 },
-  { lat:-32.5, elEdge: 22.7, elCenter: 37.8, effFwd:0.569, effRtn:1.237 },
-  { lat:-35.0, elEdge: 20.7, elCenter: 34.2, effFwd:0.482, effRtn:1.173 },
-  { lat:-37.5, elEdge: 18.7, elCenter: 30.6, effFwd:0.394, effRtn:1.110 },
-  { lat:-40.0, elEdge: 16.7, elCenter: 27.0, effFwd:0.307, effRtn:1.047 },
+  { lat: 40.0, elEdge: 16.7, elCenter: 27.0, effEdgeFwd:0.220, effEdgeRtn:1.000, effCenterFwd:0.480, effCenterRtn:1.140 },
+  { lat: 37.5, elEdge: 18.7, elCenter: 30.6, effEdgeFwd:0.307, effEdgeRtn:1.051, effCenterFwd:0.568, effCenterRtn:1.228 },
+  { lat: 35.0, elEdge: 20.7, elCenter: 34.2, effEdgeFwd:0.395, effEdgeRtn:1.103, effCenterFwd:0.655, effCenterRtn:1.315 },
+  { lat: 32.5, elEdge: 22.7, elCenter: 37.8, effEdgeFwd:0.482, effEdgeRtn:1.154, effCenterFwd:0.743, effCenterRtn:1.403 },
+  { lat: 30.0, elEdge: 24.7, elCenter: 41.4, effEdgeFwd:0.570, effEdgeRtn:1.205, effCenterFwd:0.830, effCenterRtn:1.490 },
+  { lat: 27.5, elEdge: 26.7, elCenter: 44.9, effEdgeFwd:0.657, effEdgeRtn:1.256, effCenterFwd:0.917, effCenterRtn:1.577 },
+  { lat: 25.0, elEdge: 28.7, elCenter: 48.5, effEdgeFwd:0.745, effEdgeRtn:1.308, effCenterFwd:1.005, effCenterRtn:1.665 },
+  { lat: 22.5, elEdge: 30.7, elCenter: 52.1, effEdgeFwd:0.833, effEdgeRtn:1.359, effCenterFwd:1.058, effCenterRtn:1.732 },
+  { lat: 20.0, elEdge: 32.7, elCenter: 55.7, effEdgeFwd:0.920, effEdgeRtn:1.410, effCenterFwd:1.110, effCenterRtn:1.800 },
+  { lat: 17.5, elEdge: 33.6, elCenter: 60.0, effEdgeFwd:0.961, effEdgeRtn:1.426, effCenterFwd:1.151, effCenterRtn:1.841 },
+  { lat: 15.0, elEdge: 34.6, elCenter: 64.3, effEdgeFwd:1.002, effEdgeRtn:1.442, effCenterFwd:1.192, effCenterRtn:1.883 },
+  { lat: 12.5, elEdge: 35.5, elCenter: 68.6, effEdgeFwd:1.044, effEdgeRtn:1.459, effCenterFwd:1.234, effCenterRtn:1.924 },
+  { lat: 10.0, elEdge: 36.5, elCenter: 72.8, effEdgeFwd:1.085, effEdgeRtn:1.475, effCenterFwd:1.275, effCenterRtn:1.965 },
+  { lat:  7.5, elEdge: 37.5, elCenter: 77.1, effEdgeFwd:1.126, effEdgeRtn:1.491, effCenterFwd:1.331, effCenterRtn:1.974 },
+  { lat:  5.0, elEdge: 38.4, elCenter: 81.4, effEdgeFwd:1.167, effEdgeRtn:1.508, effCenterFwd:1.387, effCenterRtn:1.982 },
+  { lat:  2.5, elEdge: 39.4, elCenter: 85.7, effEdgeFwd:1.209, effEdgeRtn:1.524, effCenterFwd:1.444, effCenterRtn:1.991 },
+  { lat:  0.0, elEdge: 40.3, elCenter: 90.0, effEdgeFwd:1.250, effEdgeRtn:1.540, effCenterFwd:1.500, effCenterRtn:2.000 },
+  { lat: -2.5, elEdge: 39.4, elCenter: 85.7, effEdgeFwd:1.209, effEdgeRtn:1.524, effCenterFwd:1.444, effCenterRtn:1.991 },
+  { lat: -5.0, elEdge: 38.4, elCenter: 81.4, effEdgeFwd:1.167, effEdgeRtn:1.508, effCenterFwd:1.387, effCenterRtn:1.982 },
+  { lat: -7.5, elEdge: 37.5, elCenter: 77.1, effEdgeFwd:1.167, effEdgeRtn:1.491, effCenterFwd:1.331, effCenterRtn:1.974 },
+  { lat:-10.0, elEdge: 36.5, elCenter: 72.8, effEdgeFwd:1.167, effEdgeRtn:1.475, effCenterFwd:1.275, effCenterRtn:1.965 },
+  { lat:-12.5, elEdge: 35.5, elCenter: 68.6, effEdgeFwd:1.085, effEdgeRtn:1.459, effCenterFwd:1.234, effCenterRtn:1.924 },
+  { lat:-15.0, elEdge: 34.6, elCenter: 64.3, effEdgeFwd:1.002, effEdgeRtn:1.442, effCenterFwd:1.192, effCenterRtn:1.883 },
+  { lat:-17.5, elEdge: 33.6, elCenter: 60.0, effEdgeFwd:0.961, effEdgeRtn:1.426, effCenterFwd:1.151, effCenterRtn:1.841 },
+  { lat:-20.0, elEdge: 32.7, elCenter: 55.7, effEdgeFwd:0.920, effEdgeRtn:1.410, effCenterFwd:1.110, effCenterRtn:1.800 },
+  { lat:-22.5, elEdge: 30.7, elCenter: 52.1, effEdgeFwd:0.833, effEdgeRtn:1.359, effCenterFwd:1.058, effCenterRtn:1.732 },
+  { lat:-25.0, elEdge: 28.7, elCenter: 48.5, effEdgeFwd:0.745, effEdgeRtn:1.308, effCenterFwd:1.005, effCenterRtn:1.665 },
+  { lat:-27.5, elEdge: 26.7, elCenter: 44.9, effEdgeFwd:0.657, effEdgeRtn:1.256, effCenterFwd:0.917, effCenterRtn:1.577 },
+  { lat:-30.0, elEdge: 24.7, elCenter: 41.4, effEdgeFwd:0.570, effEdgeRtn:1.205, effCenterFwd:0.830, effCenterRtn:1.490 },
+  { lat:-32.5, elEdge: 22.7, elCenter: 37.8, effEdgeFwd:0.482, effEdgeRtn:1.154, effCenterFwd:0.743, effCenterRtn:1.403 },
+  { lat:-35.0, elEdge: 20.7, elCenter: 34.2, effEdgeFwd:0.395, effEdgeRtn:1.103, effCenterFwd:0.655, effCenterRtn:1.315 },
+  { lat:-37.5, elEdge: 18.7, elCenter: 30.6, effEdgeFwd:0.307, effEdgeRtn:1.051, effCenterFwd:0.568, effCenterRtn:1.228 },
+  { lat:-40.0, elEdge: 16.7, elCenter: 27.0, effEdgeFwd:0.220, effEdgeRtn:1.000, effCenterFwd:0.480, effCenterRtn:1.140 },
 ];
 
-// Snap to nearest lat row; returns the entry or null if outside ±40°.
+// Snap to nearest lat row; returns the entry or null if outside grid range.
 function ka2517EfficiencyLookup(latDeg) {
-  if (Math.abs(latDeg) > 40.5) return null;
+  if (Math.abs(latDeg) > 41.25) return null;
   let best = null, bestDist = Infinity;
   for (const r of KA2517_EFFICIENCY_GRID) {
     const d = Math.abs(r.lat - latDeg);
     if (d < bestDist) { bestDist = d; best = r; }
   }
   return best;
+}
+
+// Linearly interpolate FWD/RTN efficiency given a terminal lat AND its current
+// satellite elevation. Returns { effFwd, effRtn } or null if grid range exceeded.
+// At elEdge, uses edge values. At elCenter, uses center values. Linear in between.
+// Above elCenter (rare; only at very low latitudes near 90° peak), clamps to center.
+// Below elEdge, returns the edge values (link should be flagged unviable upstream).
+function ka2517EfficiencyAt(latDeg, elDeg) {
+  const r = ka2517EfficiencyLookup(latDeg);
+  if (!r) return null;
+  const span = r.elCenter - r.elEdge;
+  let frac = span > 0 ? (elDeg - r.elEdge) / span : 0;
+  if (frac < 0) frac = 0;
+  if (frac > 1) frac = 1;
+  return {
+    effFwd: r.effEdgeFwd + frac * (r.effCenterFwd - r.effEdgeFwd),
+    effRtn: r.effEdgeRtn + frac * (r.effCenterRtn - r.effEdgeRtn),
+    elEdge: r.elEdge, elCenter: r.elCenter,
+    fracOfPass: frac,
+  };
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -3244,6 +3265,12 @@ function InterferenceTab({
   const [ready, setReady] = useState(false);
   const [zoomK, setZoomK] = useState(1);
 
+  // ── Strategy-comparison state ──
+  // windowMin = duration of the analysis window (minutes); 287 ≈ one mPower orbital period
+  const [stratWindowMin, setStratWindowMin] = useState(287);
+  const [stratResults, setStratResults] = useState(null); // null until "RUN" pressed
+  const [stratRunning, setStratRunning] = useState(false);
+
   // Load topojson once for this tab
   useEffect(() => {
     let cancelled = false;
@@ -3318,12 +3345,13 @@ function InterferenceTab({
 
   const reports = interfActiveLinks.map((link, i) => {
     if (!link.viable) {
-      // Even non-viable terminals show their MHz lookup (geographic only)
-      const eff = ka2517EfficiencyLookup(link.term.lat);
+      // Non-viable: no current elevation, so we can't compute meaningful MHz.
+      // Just flag whether the terminal is inside the grid's lat coverage.
+      const inGrid = ka2517EfficiencyLookup(link.term.lat) != null;
       return { term: link.term, sat: link.sat, gw: link.gw, viable: false,
-               cn_baseline: null, cni_db: null, interferers: [],
+               cn_baseline: null, cni_db: null, interferers: [], iOverN_db: null,
                modcod_base: null, modcod_intf: null, margin_db: null,
-               mhzGrid: eff };
+               effAtCurEl: null, inGrid };
     }
     const fl = linkBudgetFL(link.sat.el, true);
     const cn_baseline = fl.C_N;
@@ -3352,14 +3380,269 @@ function InterferenceTab({
     const modcod_intf = dvbS2xModcod(cni_db);
     const margin_db = modcod_intf ? (cni_db - modcod_intf.minCN) : null;
 
-    // Look up MHz needed for this terminal's latitude (snap-to-nearest)
-    const mhzGrid = ka2517EfficiencyLookup(link.term.lat);
+    // I/N (dB) — interference-to-noise ratio. Positive = interference exceeds noise.
+    // null when no interferers at all (I = 0 → I/N = -infinity, displayed as "no I").
+    const iOverN_db = intfRatio > 0 ? 10 * Math.log10(intfRatio / noiseRatio) : null;
+
+    // Elevation-aware efficiency: interpolates between edge-of-pass and
+    // center-of-pass values based on the current sat's actual elevation.
+    // This is what makes MHz cost geometry-dependent (and lets strategy
+    // comparisons differ by handover policy).
+    const effAtCurEl = ka2517EfficiencyAt(link.term.lat, link.sat.el);
 
     return { term: link.term, sat: link.sat, gw: link.gw, viable: true,
-             cn_baseline, cni_db, interferers,
+             cn_baseline, cni_db, interferers, iOverN_db,
              modcod_base, modcod_intf, margin_db,
-             mhzGrid };
+             effAtCurEl };
   });
+
+  // ─── 4b. Beam footprint size at terminal elevations (for slider readout) ──
+  // Computes minor-axis radius (km) on the ground for the current beam-half setting,
+  // averaged across active terminals so the slider readout reflects the live scenario.
+  const footprintSizeStats = (() => {
+    const els = interfActiveLinks.filter(l => l.viable && l.sat).map(l => l.sat.el);
+    if (els.length === 0) return null;
+    const avgEl = els.reduce((a, b) => a + b, 0) / els.length;
+    const minEl = Math.min(...els);
+    const maxEl = Math.max(...els);
+    const minorAt = (elDeg) => slantRange(elDeg) * Math.tan(toRad(interfBeamHalf));
+    const majorAt = (elDeg) => minorAt(elDeg) / Math.sin(toRad(elDeg));
+    return {
+      avgEl, minEl, maxEl,
+      minorAvgKm: minorAt(avgEl),
+      majorAvgKm: majorAt(avgEl),
+      minorMinElKm: minorAt(minEl),
+      majorMinElKm: majorAt(minEl),
+    };
+  })();
+
+
+  // ─── 4c. Time-series strategy comparison engine ────────────────────────
+  // Simulates static terminals over an analysis window (minutes), computing
+  // per-terminal MHz consumption and handover counts under three strategies:
+  //
+  //   S_BEST  — pick highest-elevation viable sat at every step (current live behaviour)
+  //   S_MID   — lock to a sat near the middle of its pass; switch only when forced
+  //   S_EDGE  — ride the same sat to its lowest viable elevation before switching
+  //
+  // The MHz cost differs because efficiency drops with elevation (lower EL =>
+  // more MHz per Mbps). C/(N+I) per terminal also differs because angular
+  // separation at sat depends on which sat each terminal is currently using.
+  //
+  // Returns null until user presses "RUN COMPARISON".
+  const runStrategyComparison = useCallback(() => {
+    setStratRunning(true);
+    // Defer to next tick so the UI shows a "running" state
+    setTimeout(() => {
+      const STEP_SEC = 60;                          // 1-minute resolution
+      const N_STEPS  = Math.max(2, Math.floor(stratWindowMin));
+      const SAT_HYS  = 2;                           // deg, matches existing convention
+      const t0       = simTime;                     // start at current sim-time
+
+      // Helper: compute best (highest-EL viable) sat for a terminal at time t
+      const bestSatAt = (lat, lon, t) => {
+        let bestEl = -90, bestIdx = -1, bestLon = 0;
+        for (let i = 0; i < numSats; i++) {
+          const sLon = satLon(i, t, numSats);
+          const el = elevAngle(lat, lon, sLon);
+          if (el > bestEl) { bestEl = el; bestIdx = i; bestLon = sLon; }
+        }
+        return { idx: bestIdx, lon: bestLon, el: bestEl };
+      };
+
+      // For each strategy, simulate per-terminal across all steps.
+      // strategyState[term.id] = { satIdx, lockedSinceEl, etc. }
+      const strategies = ["BEST", "MID", "EDGE"];
+      const results = {};
+      for (const strat of strategies) results[strat] = {
+        terminals: interfTerminals.map(t => ({
+          id: t.id, label: t.label, color: t.color,
+          mhzSamples: [],      // MHz total per step
+          elSamples:  [],      // serving-sat elevation per step
+          satSamples: [],      // sat idx per step
+          handovers:  0,       // count of sat changes
+          unviable:   0,       // count of steps with no viable sat or no MHz lookup
+          cnSamples:  [],      // C/N baseline per step
+          cniSamples: [],      // C/(N+I) per step (with interference from other terms)
+        })),
+        timeSamples: [],       // shared time axis (minutes since t0)
+      };
+
+      // Per-strategy per-terminal mutable state
+      const stratState = {
+        BEST: interfTerminals.map(() => ({ curIdx: -1, curEl: -90 })),
+        MID:  interfTerminals.map(() => ({ curIdx: -1, curEl: -90 })),
+        EDGE: interfTerminals.map(() => ({ curIdx: -1, curEl: -90 })),
+      };
+
+      for (let step = 0; step < N_STEPS; step++) {
+        const t = t0 + step * STEP_SEC;
+        const tMin = step * STEP_SEC / 60;
+        for (const strat of strategies) results[strat].timeSamples.push(tMin);
+
+        // For each strategy, decide each terminal's current sat for this step
+        for (const strat of strategies) {
+          const states  = stratState[strat];
+          const result  = results[strat];
+
+          // First pass: pick sats per terminal under the strategy's policy
+          const stepLinks = interfTerminals.map((term, ti) => {
+            const st = states[ti];
+            const best = bestSatAt(term.lat, term.lon, t);
+            let chosenIdx, chosenLon, chosenEl;
+
+            if (strat === "BEST") {
+              // Apply small hysteresis vs current sat to avoid 1° wobbles
+              if (st.curIdx >= 0) {
+                const curLon = satLon(st.curIdx, t, numSats);
+                const curEl = elevAngle(term.lat, term.lon, curLon);
+                if (curEl >= ka2517MinEl && (best.el - curEl) < SAT_HYS) {
+                  chosenIdx = st.curIdx; chosenLon = curLon; chosenEl = curEl;
+                } else {
+                  chosenIdx = best.idx; chosenLon = best.lon; chosenEl = best.el;
+                }
+              } else {
+                chosenIdx = best.idx; chosenLon = best.lon; chosenEl = best.el;
+              }
+            } else if (strat === "EDGE") {
+              // Ride current sat until it falls below ka2517MinEl, then switch to best
+              if (st.curIdx >= 0) {
+                const curLon = satLon(st.curIdx, t, numSats);
+                const curEl = elevAngle(term.lat, term.lon, curLon);
+                if (curEl >= ka2517MinEl) {
+                  chosenIdx = st.curIdx; chosenLon = curLon; chosenEl = curEl;
+                } else {
+                  chosenIdx = best.idx; chosenLon = best.lon; chosenEl = best.el;
+                }
+              } else {
+                chosenIdx = best.idx; chosenLon = best.lon; chosenEl = best.el;
+              }
+            } else { // MID
+              // Lock to current sat as long as we're past the "midpoint" — defined as
+              // the moment where current EL is within 5° of its peak. We approximate
+              // peak-detection by locking when the current EL is rising or has just
+              // peaked (curEl >= prev-recorded-el OR within 5° of best.el).
+              if (st.curIdx >= 0) {
+                const curLon = satLon(st.curIdx, t, numSats);
+                const curEl = elevAngle(term.lat, term.lon, curLon);
+                // Switch if current sat is now below threshold OR we're descending past
+                // halfway (curEl is significantly worse than best AND not improving)
+                const significantDrop = (best.el - curEl) > 8;  // best is 8°+ better
+                if (curEl >= ka2517MinEl && !significantDrop) {
+                  chosenIdx = st.curIdx; chosenLon = curLon; chosenEl = curEl;
+                } else {
+                  chosenIdx = best.idx; chosenLon = best.lon; chosenEl = best.el;
+                }
+              } else {
+                chosenIdx = best.idx; chosenLon = best.lon; chosenEl = best.el;
+              }
+            }
+
+            // Track handovers
+            if (st.curIdx >= 0 && st.curIdx !== chosenIdx) {
+              result.terminals[ti].handovers += 1;
+            }
+            states[ti].curIdx = chosenIdx;
+            states[ti].curEl  = chosenEl;
+
+            const viable = chosenEl >= ka2517MinEl;
+            return { term, chosenIdx, chosenLon, chosenEl, viable };
+          });
+
+          // Second pass: compute C/(N+I) per terminal accounting for interference
+          // from co-sat, same-color terminals (uses current beam & rolloff settings)
+          stepLinks.forEach((lk, ti) => {
+            const result_t = result.terminals[ti];
+            if (!lk.viable) {
+              result_t.unviable += 1;
+              result_t.mhzSamples.push(null);
+              result_t.elSamples.push(null);
+              result_t.satSamples.push(null);
+              result_t.cnSamples.push(null);
+              result_t.cniSamples.push(null);
+              return;
+            }
+            // Baseline C/N from existing function
+            const fl = linkBudgetFL(lk.chosenEl, true);
+            const cn = fl.C_N;
+            // Aggregate I from all other terminals on the same sat & color
+            const myColor = colorOf(ti);
+            let intfRatio = 0;
+            for (let tj = 0; tj < stepLinks.length; tj++) {
+              if (tj === ti) continue;
+              const other = stepLinks[tj];
+              if (!other.viable) continue;
+              if (other.chosenIdx !== lk.chosenIdx) continue;
+              if (interfReuseEnabled && colorOf(tj) !== myColor) continue;
+              const theta = angSepAtSat(lk.chosenLon,
+                {lat: lk.term.lat, lon: lk.term.lon},
+                {lat: other.term.lat, lon: other.term.lon});
+              const gOff = beamRolloffDb(theta, interfBeamHalf, interfRolloffDb);
+              const ci_db = -gOff;
+              intfRatio += Math.pow(10, -ci_db / 10);
+            }
+            const noiseRatio = Math.pow(10, -cn / 10);
+            const cni = -10 * Math.log10(noiseRatio + intfRatio);
+
+            // MHz consumption — elevation-aware! Uses lk.chosenEl so each strategy
+            // pays differently based on which sat it picked. This is what makes
+            // S_BEST (high EL → high efficiency → fewer MHz) differ from
+            // S_EDGE (low EL → low efficiency → more MHz) for the same Mbps target.
+            const eff = ka2517EfficiencyAt(lk.term.lat, lk.chosenEl);
+            let mhzTot = null;
+            if (eff && eff.effFwd > 0 && eff.effRtn > 0) {
+              const mhzFwd = interfMbpsFwd / eff.effFwd;
+              const mhzRtn = interfMbpsRtn / eff.effRtn;
+              mhzTot = mhzFwd + mhzRtn;
+            }
+
+            result_t.mhzSamples.push(mhzTot);
+            result_t.elSamples.push(lk.chosenEl);
+            result_t.satSamples.push(lk.chosenIdx);
+            result_t.cnSamples.push(cn);
+            result_t.cniSamples.push(cni);
+          });
+        }
+      }
+
+      // Aggregate into summary metrics per strategy
+      const summary = {};
+      for (const strat of strategies) {
+        const r = results[strat];
+        let mhzAccum = 0, mhzN = 0;
+        let elAccum  = 0, elN  = 0;
+        let cniAccum = 0, cniN = 0;
+        let totalHandovers = 0;
+        let totalSamples   = 0, viableSamples = 0;
+        for (const term of r.terminals) {
+          totalHandovers += term.handovers;
+          for (const m of term.mhzSamples) {
+            totalSamples += 1;
+            if (m != null) { mhzAccum += m; mhzN += 1; viableSamples += 1; }
+          }
+          for (const e of term.elSamples) if (e != null) { elAccum += e; elN += 1; }
+          for (const c of term.cniSamples) if (c != null) { cniAccum += c; cniN += 1; }
+        }
+        summary[strat] = {
+          meanMhz: mhzN > 0 ? mhzAccum / mhzN : null,
+          meanEl:  elN  > 0 ? elAccum  / elN  : null,
+          meanCni: cniN > 0 ? cniAccum / cniN : null,
+          handoversPerHr: totalHandovers / (stratWindowMin / 60),
+          // Viability: fraction of (term × step) samples where link was up
+          viableFrac: totalSamples > 0 ? viableSamples / totalSamples : 0,
+        };
+      }
+      const baseline = summary.BEST.meanMhz;
+      for (const strat of strategies) {
+        const m = summary[strat].meanMhz;
+        summary[strat].costVsBest = (m != null && baseline != null) ? (m / baseline - 1) : null;
+      }
+
+      setStratResults({ summary, traces: results, windowMin: stratWindowMin });
+      setStratRunning(false);
+    }, 50);
+  }, [simTime, numSats, interfTerminals, ka2517MinEl, interfBeamHalf, interfRolloffDb,
+      interfReuseEnabled, interfMbpsFwd, interfMbpsRtn, stratWindowMin]);
 
   // ─── 5. Map drawing ─────────────────────────────────────────
   const draw = useCallback(() => {
@@ -3612,8 +3895,8 @@ function InterferenceTab({
       ctx.fillStyle = link.term.color;
       ctx.fill();
       ctx.strokeStyle = "#0b1622"; ctx.lineWidth = 1.5; ctx.stroke();
-      // label (terminal name + MHz needed for current rates)
-      const eff = ka2517EfficiencyLookup(link.term.lat);
+      // label (terminal name + MHz needed for current rates, at current sat elevation)
+      const eff = ka2517EfficiencyAt(link.term.lat, link.sat.el);
       const mhzFwd = (eff && eff.effFwd > 0) ? interfMbpsFwd / eff.effFwd : null;
       const mhzRtn = (eff && eff.effRtn > 0) ? interfMbpsRtn / eff.effRtn : null;
       const mhzTot = (mhzFwd != null && mhzRtn != null) ? mhzFwd + mhzRtn : null;
@@ -3844,11 +4127,45 @@ function InterferenceTab({
             <div style={secStyle}>BEAM MODEL</div>
             <div style={{marginBottom:"10px"}}>
               <label style={{color:"#6088b0", fontSize:"12px", display:"block", marginBottom:"3px"}}>
-                Spot beam half-width (deg, at sat) — current: {interfBeamHalf.toFixed(2)}°
+                Spot beam half-width — current:&nbsp;
+                <span style={{color:"#00cfff", fontWeight:"bold"}}>{interfBeamHalf.toFixed(2)}°</span>
+                {footprintSizeStats && (
+                  <>
+                    &nbsp;→&nbsp;
+                    <span style={{color:"#00cfff"}}>
+                      {footprintSizeStats.minorAvgKm.toFixed(0)} km
+                    </span>
+                    <span style={{color:"#5a7090"}}>
+                      &nbsp;minor radius @ avg EL {footprintSizeStats.avgEl.toFixed(1)}°
+                    </span>
+                  </>
+                )}
               </label>
               <input type="range" min="0.2" max="2.0" step="0.1" value={interfBeamHalf}
                 onChange={e=>setInterfBeamHalf(parseFloat(e.target.value))}
                 style={{width:"100%"}}/>
+              {footprintSizeStats && (
+                <div style={{color:"#5a7090", fontSize:"11px", marginTop:"4px", lineHeight:1.4}}>
+                  Footprint ellipse on ground:&nbsp;
+                  <span style={{color:"#8ab0d0"}}>
+                    {footprintSizeStats.minorAvgKm.toFixed(0)} × {footprintSizeStats.majorAvgKm.toFixed(0)} km
+                  </span>
+                  &nbsp;(minor × major @ avg EL {footprintSizeStats.avgEl.toFixed(1)}°).
+                  {footprintSizeStats.minEl !== footprintSizeStats.maxEl && (
+                    <>
+                      &nbsp;Worst-case at lowest EL ({footprintSizeStats.minEl.toFixed(1)}°):&nbsp;
+                      <span style={{color:"#ffd700"}}>
+                        {footprintSizeStats.minorMinElKm.toFixed(0)} × {footprintSizeStats.majorMinElKm.toFixed(0)} km
+                      </span>.
+                    </>
+                  )}
+                </div>
+              )}
+              {!footprintSizeStats && (
+                <div style={{color:"#5a7090", fontSize:"11px", marginTop:"4px", fontStyle:"italic"}}>
+                  Place at least one viable terminal to see the ground footprint size.
+                </div>
+              )}
             </div>
             <div style={{marginBottom:"10px"}}>
               <label style={{color:"#6088b0", fontSize:"12px", display:"block", marginBottom:"3px"}}>
@@ -3928,15 +4245,18 @@ function InterferenceTab({
 
           <div style={panelStyle}>
             <div style={secStyle}>PER-TERMINAL FORWARD-LINK RESULTS</div>
+            <div style={{overflowX:"auto", width:"100%"}}>
             {(() => {
-              // MHz needed = Mbps / efficiency. Compute per terminal from current rates.
-              const mhzFor = (eff, fwd) => eff && eff > 0 ? (fwd / eff) : null;
+              // MHz needed = Mbps / efficiency, where efficiency comes from the
+              // elevation-aware lookup (interpolated between edge-of-pass and
+              // center-of-pass based on the current chosen sat's elevation).
+              const mhzFor = (eff, mbps) => eff && eff > 0 ? (mbps / eff) : null;
               // Per-satellite totals, indexed by sat idx
               const satMhzTotals = new Map();
               for (const r of reports) {
-                if (!r.mhzGrid || r.sat == null) continue;
-                const fwd = mhzFor(r.mhzGrid.effFwd, interfMbpsFwd);
-                const rtn = mhzFor(r.mhzGrid.effRtn, interfMbpsRtn);
+                if (!r.effAtCurEl || r.sat == null) continue;
+                const fwd = mhzFor(r.effAtCurEl.effFwd, interfMbpsFwd);
+                const rtn = mhzFor(r.effAtCurEl.effRtn, interfMbpsRtn);
                 if (fwd == null || rtn == null) continue;
                 const k = r.sat.idx;
                 const cur = satMhzTotals.get(k) || { sat: r.sat, fwd: 0, rtn: 0, tot: 0, count: 0 };
@@ -3960,6 +4280,8 @@ function InterferenceTab({
                       <th style={tableTh}>ΔdB</th>
                       <th style={tableTh}>MODCOD (W/INTF)</th>
                       <th style={tableTh}>MARGIN</th>
+                      <th style={tableTh}>I/N</th>
+                      <th style={tableTh}>REGIME</th>
                       <th style={tableTh}>MHz FWD ({interfMbpsFwd} Mbps)</th>
                       <th style={tableTh}>MHz RTN ({interfMbpsRtn} Mbps)</th>
                       <th style={tableTh}>MHz TOT</th>
@@ -3970,11 +4292,26 @@ function InterferenceTab({
                       const delta = (r.cni_db != null && r.cn_baseline != null) ? (r.cni_db - r.cn_baseline) : null;
                       const deltaColor = delta == null ? "#7090b0" : delta > -0.5 ? "#00ff88" : delta > -3 ? "#ffd700" : "#ff6b35";
                       const marginColor = r.margin_db == null ? "#ff6b35" : r.margin_db < 1 ? "#ff6b35" : r.margin_db < 3 ? "#ffd700" : "#00ff88";
-                      const mhzFwd = r.mhzGrid && r.mhzGrid.effFwd > 0 ? interfMbpsFwd / r.mhzGrid.effFwd : null;
-                      const mhzRtn = r.mhzGrid && r.mhzGrid.effRtn > 0 ? interfMbpsRtn / r.mhzGrid.effRtn : null;
+                      const mhzFwd = r.effAtCurEl && r.effAtCurEl.effFwd > 0 ? interfMbpsFwd / r.effAtCurEl.effFwd : null;
+                      const mhzRtn = r.effAtCurEl && r.effAtCurEl.effRtn > 0 ? interfMbpsRtn / r.effAtCurEl.effRtn : null;
                       const mhzTot = (mhzFwd != null && mhzRtn != null) ? mhzFwd + mhzRtn : null;
                       // Color total by magnitude
                       const mhzColor = mhzTot == null ? "#7090b0" : mhzTot < 30 ? "#00ff88" : mhzTot < 100 ? "#ffd700" : "#ff6b35";
+                      // I/N regime classifier — positive I/N means interference exceeds noise.
+                      //   I/N < -6 dB  →  noise-limited (interference invisible: < ~1 dB hit)
+                      //   -6 ≤ I/N < 0 →  partial (interference noticeable: 1-3 dB hit)
+                      //   I/N ≥ 0 dB  →  interference-dominated (≥ 3 dB hit, noise no longer limits)
+                      let regimeLabel = "—", regimeColor = "#7090b0";
+                      if (r.iOverN_db == null) {
+                        regimeLabel = r.viable ? "no I" : "—";
+                        regimeColor = r.viable ? "#00ff88" : "#7090b0";
+                      } else if (r.iOverN_db < -6) {
+                        regimeLabel = "NOISE-LIMITED"; regimeColor = "#00ff88";
+                      } else if (r.iOverN_db < 0) {
+                        regimeLabel = "PARTIAL"; regimeColor = "#ffd700";
+                      } else {
+                        regimeLabel = "I-DOMINATED"; regimeColor = "#ff6b35";
+                      }
                       return (
                         <tr key={r.term.id}>
                           <td style={{...tableTd, color:r.term.color, fontWeight:"bold"}}>● {r.term.label}</td>
@@ -3988,6 +4325,8 @@ function InterferenceTab({
                             {r.modcod_intf ? r.modcod_intf.label : "LINK FAIL"}
                           </td>
                           <td style={{...tableTd, color: marginColor}}>{r.margin_db != null ? r.margin_db.toFixed(1) + " dB" : "—"}</td>
+                          <td style={{...tableTd, color: regimeColor}}>{r.iOverN_db == null ? "—" : (r.iOverN_db >= 0 ? "+" : "") + r.iOverN_db.toFixed(1) + " dB"}</td>
+                          <td style={{...tableTd, color: regimeColor, fontWeight:"bold"}}>{regimeLabel}</td>
                           <td style={tableTd}>{mhzFwd != null ? mhzFwd.toFixed(1) : "—"}</td>
                           <td style={tableTd}>{mhzRtn != null ? mhzRtn.toFixed(1) : "—"}</td>
                           <td style={{...tableTd, color: mhzColor, fontWeight:"bold"}}>{mhzTot != null ? mhzTot.toFixed(1) : "—"}</td>
@@ -4005,7 +4344,7 @@ function InterferenceTab({
                             <td style={{...tableTd, color:"#7090b0", fontStyle:"italic"}}>
                               Σ on mPOWER-{idx+1} ({t.count} term)
                             </td>
-                            <td style={tableTd} colSpan={8}/>
+                            <td style={tableTd} colSpan={10}/>
                             <td style={{...tableTd, color:"#8ab0d0"}}>{t.fwd.toFixed(1)}</td>
                             <td style={{...tableTd, color:"#8ab0d0"}}>{t.rtn.toFixed(1)}</td>
                             <td style={{...tableTd, color: utilColor, fontWeight:"bold"}}>
@@ -4019,10 +4358,12 @@ function InterferenceTab({
                 </table>
               );
             })()}
+            </div>
           </div>
 
           <div style={panelStyle}>
             <div style={secStyle}>PAIR-WISE INTERFERENCE DETAIL (same satellite, same colour)</div>
+            <div style={{overflowX:"auto", width:"100%"}}>
             {(() => {
               const allPairs = [];
               for (const r of reports) {
@@ -4071,7 +4412,190 @@ function InterferenceTab({
                 </table>
               );
             })()}
+            </div>
           </div>
+
+
+          {/* ── Strategy comparison panel ── */}
+          <div style={panelStyle}>
+            <div style={{display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:"10px"}}>
+              <div style={secStyle}>STRATEGY COMPARISON — RESOURCE COST vs HANDOVER POLICY</div>
+              <div style={{display:"flex", alignItems:"center", gap:"8px"}}>
+                <label style={{color:"#6088b0", fontSize:"12px"}}>Window:</label>
+                <input type="number" min="10" max="1440" step="1" value={stratWindowMin}
+                  onChange={e=>setStratWindowMin(Math.max(10, Math.min(1440, parseInt(e.target.value) || 10)))}
+                  style={{background:"#0d1a2a", border:"1px solid #2e4270",
+                    color:"#00cfff", padding:"4px 8px", width:"70px",
+                    borderRadius:"3px", fontSize:"13px", fontFamily:"inherit"}}/>
+                <span style={{color:"#5a7090", fontSize:"11px"}}>min</span>
+                <button onClick={() => setStratWindowMin(287)}
+                  style={{background:"#0d1a2a", border:"1px solid #2e4270",
+                    color:"#7090b0", padding:"4px 8px", borderRadius:"3px",
+                    cursor:"pointer", fontSize:"11px", fontFamily:"inherit"}}>1 orbit (287)</button>
+                <button onClick={runStrategyComparison} disabled={stratRunning}
+                  style={{background: stratRunning ? "#1a2640" : "#0e2645",
+                    border: "1px solid #00cfff", color: "#00cfff",
+                    padding:"6px 14px", borderRadius:"3px",
+                    cursor: stratRunning ? "wait" : "pointer",
+                    fontSize:"12px", fontFamily:"inherit", fontWeight:"bold"}}>
+                  {stratRunning ? "RUNNING..." : "▶ RUN"}
+                </button>
+              </div>
+            </div>
+
+            <div style={{color:"#8ab0d0", fontSize:"12px", marginBottom:"12px", lineHeight:1.5}}>
+              Simulates the next <span style={{color:"#00cfff"}}>{stratWindowMin}</span> minutes of constellation
+              motion at 1-min resolution under three handover policies, using the current beam, rolloff,
+              reuse, and Mbps settings. Static terminals only; results assume terminal positions don't move.
+            </div>
+
+            {!stratResults && !stratRunning && (
+              <div style={{color:"#5a7090", fontSize:"13px", fontStyle:"italic", padding:"20px",
+                           textAlign:"center", border:"1px dashed #2e4270", borderRadius:"3px"}}>
+                Press ▶ RUN to simulate. Results compare best-elevation tracking vs locking through
+                mid-pass vs riding to edge-of-pass.
+              </div>
+            )}
+
+            {stratRunning && (
+              <div style={{color:"#00cfff", fontSize:"13px", padding:"20px", textAlign:"center"}}>
+                Simulating {stratWindowMin} minutes × {numSats} satellites × {interfTerminals.length} terminals...
+              </div>
+            )}
+
+            {stratResults && (() => {
+              const stratMeta = {
+                BEST: { label: "S_BEST",  desc: "Always pick highest-EL viable sat (current live behaviour)", color: "#00ff88" },
+                MID:  { label: "S_MID",   desc: "Lock to current sat through mid-pass; switch only when 8°+ behind",  color: "#00cfff" },
+                EDGE: { label: "S_EDGE",  desc: "Ride current sat to lowest viable EL before switching",  color: "#ff6b35" },
+              };
+              const cardStyle = {
+                background:"#0d1a2a", border:"1px solid #1e3055", borderRadius:"4px",
+                padding:"12px", flex:"1 1 0",
+              };
+              const metricRow = (label, value, color="#8ab0d0") => (
+                <div style={{display:"flex", justifyContent:"space-between", marginBottom:"4px",
+                             fontSize:"13px", fontFamily:"'Courier New', monospace"}}>
+                  <span style={{color:"#6088b0"}}>{label}</span>
+                  <span style={{color, fontWeight:"bold"}}>{value}</span>
+                </div>
+              );
+              return (
+                <>
+                  {/* Three summary cards */}
+                  <div style={{display:"flex", gap:"8px", marginBottom:"14px"}}>
+                    {["BEST", "MID", "EDGE"].map(s => {
+                      const sum = stratResults.summary[s];
+                      const meta = stratMeta[s];
+                      const cost = sum.costVsBest;
+                      const costStr = (cost == null) ? "—"
+                                    : (s === "BEST") ? "(baseline)"
+                                    : (cost >= 0 ? "+" : "") + (cost * 100).toFixed(1) + "%";
+                      const costColor = (s === "BEST" || cost == null) ? "#7090b0"
+                                      : cost < 0.05 ? "#00ff88"
+                                      : cost < 0.20 ? "#ffd700"
+                                      : "#ff6b35";
+                      return (
+                        <div key={s} style={{...cardStyle, borderColor: meta.color + "55"}}>
+                          <div style={{color:meta.color, fontSize:"15px", fontWeight:"bold", marginBottom:"3px"}}>
+                            {meta.label}
+                          </div>
+                          <div style={{color:"#5a7090", fontSize:"11px", marginBottom:"10px", lineHeight:1.4}}>
+                            {meta.desc}
+                          </div>
+                          {metricRow("Mean MHz/term", sum.meanMhz != null ? sum.meanMhz.toFixed(1) + " MHz" : "—")}
+                          {metricRow("Mean EL", sum.meanEl != null ? sum.meanEl.toFixed(1) + "°" : "—")}
+                          {metricRow("Mean C/(N+I)", sum.meanCni != null ? sum.meanCni.toFixed(1) + " dB" : "—")}
+                          {metricRow("Handovers/hr", sum.handoversPerHr.toFixed(2))}
+                          {metricRow("Link uptime", (sum.viableFrac * 100).toFixed(1) + "%")}
+                          {metricRow("Cost vs BEST", costStr, costColor)}
+                        </div>
+                      );
+                    })}
+                  </div>
+
+                  {/* Per-terminal MHz time-series — three small charts side by side */}
+                  <div style={secStyle}>PER-TERMINAL MHz CONSUMPTION OVER {stratResults.windowMin} MIN</div>
+                  <div style={{display:"flex", gap:"8px", flexWrap:"wrap"}}>
+                    {["BEST", "MID", "EDGE"].map(s => {
+                      const traces = stratResults.traces[s];
+                      // Build chart data: [{t, "Term A": mhz, "Term B": mhz, ...}, ...]
+                      const data = traces.timeSamples.map((tMin, idx) => {
+                        const row = { t: Math.round(tMin) };
+                        traces.terminals.forEach(term => {
+                          row[term.label] = term.mhzSamples[idx];
+                        });
+                        return row;
+                      });
+                      // Extract per-terminal handover events: where serving sat changes
+                      // (excluding null→sat or sat→null transitions, which are link-drop/recover).
+                      const handoverEvents = [];
+                      traces.terminals.forEach(term => {
+                        for (let i = 1; i < term.satSamples.length; i++) {
+                          const prev = term.satSamples[i-1];
+                          const cur  = term.satSamples[i];
+                          if (prev != null && cur != null && prev !== cur) {
+                            handoverEvents.push({
+                              tMin: traces.timeSamples[i],
+                              color: term.color,
+                              label: term.label,
+                              from: prev, to: cur,
+                            });
+                          }
+                        }
+                      });
+                      const meta = stratMeta[s];
+                      return (
+                        <div key={s} style={{flex:"1 1 280px", minWidth:"280px",
+                          background:"#0d1a2a", border:`1px solid ${meta.color}55`,
+                          borderRadius:"3px", padding:"6px"}}>
+                          <div style={{display:"flex", justifyContent:"space-between", alignItems:"baseline", marginBottom:"4px"}}>
+                            <div style={{color:meta.color, fontSize:"11px", fontWeight:"bold"}}>
+                              {meta.label}
+                            </div>
+                            <div style={{color:"#5a7090", fontSize:"10px"}}>
+                              {handoverEvents.length} handover{handoverEvents.length === 1 ? "" : "s"}
+                            </div>
+                          </div>
+                          <ResponsiveContainer width="100%" height={150}>
+                            <LineChart data={data} margin={{top:4, right:8, bottom:18, left:0}}>
+                              <CartesianGrid strokeDasharray="2 2" stroke="#1e3055"/>
+                              <XAxis dataKey="t" type="number" domain={[0, "dataMax"]}
+                                stroke="#2e4270" tick={{fill:"#4a6a8a", fontSize:9}}
+                                label={{value:"min", position:"insideBottom", offset:-2, fill:"#4a6a8a", fontSize:9}}/>
+                              <YAxis stroke="#2e4270" tick={{fill:"#4a6a8a", fontSize:9}}
+                                label={{value:"MHz", angle:-90, position:"insideLeft", offset:14, fill:"#4a6a8a", fontSize:9}}/>
+                              <Tooltip contentStyle={{background:"#0a1421", border:"1px solid #2e4270", fontSize:11}}
+                                labelStyle={{color:"#7090b0"}}/>
+                              {/* Handover markers — colored vertical lines at each event */}
+                              {handoverEvents.map((ev, ei) => (
+                                <ReferenceLine key={"ho-" + ei} x={ev.tMin}
+                                  stroke={ev.color} strokeOpacity={0.5}
+                                  strokeWidth={1} strokeDasharray="3 2"
+                                  ifOverflow="extendDomain"/>
+                              ))}
+                              {traces.terminals.map(term => (
+                                <Line key={term.id} type="monotone" dataKey={term.label}
+                                  stroke={term.color} strokeWidth={1.5} dot={false}
+                                  isAnimationActive={false} connectNulls={false}/>
+                              ))}
+                            </LineChart>
+                          </ResponsiveContainer>
+                        </div>
+                      );
+                    })}
+                  </div>
+                  <div style={{color:"#5a7090", fontSize:"11px", marginTop:"8px",
+                               fontStyle:"italic", lineHeight:1.4}}>
+                    Solid coloured lines: per-terminal MHz consumption.&nbsp;
+                    Dashed coloured verticals: satellite handover events for that terminal.&nbsp;
+                    Gaps in the lines indicate the link was unviable (no sat above min elevation) at that minute.
+                  </div>
+                </>
+              );
+            })()}
+          </div>
+
 
           <div style={{...panelStyle, background:"#0a1421"}}>
             <div style={secStyle}>HOW TO READ THIS</div>
@@ -4093,6 +4617,18 @@ function InterferenceTab({
                 to relocate it; the map and tables redraw on every change.
               </div>
               <div style={{marginBottom:"6px"}}>
+                <span style={{color:"#00cfff"}}>▸ I/N and REGIME</span> — interference-to-noise ratio
+                in dB. Negative means noise dominates the link; positive means interference exceeds
+                noise. Three regimes: <span style={{color:"#00ff88"}}>NOISE-LIMITED</span> (I/N &lt; −6 dB,
+                interference adds &lt; 1 dB to the link budget),
+                <span style={{color:"#ffd700"}}> PARTIAL</span> (−6 ≤ I/N &lt; 0 dB, interference adds
+                1–3 dB), <span style={{color:"#ff6b35"}}>I-DOMINATED</span> (I/N ≥ 0, interference now
+                contributes more than noise — and the link is no longer noise-limited).
+                A terminal at high latitude has lower baseline C/N, so it tolerates more raw I/N
+                before tipping into the dominated regime; a terminal at the equator with a strong
+                C/N can shift to I-dominated with relatively little interference.
+              </div>
+              <div style={{marginBottom:"6px"}}>
                 <span style={{color:"#00cfff"}}>▸ MHz columns</span> — bandwidth needed per terminal,
                 computed as <span style={{fontFamily:"'Courier New', monospace"}}>Mbps / efficiency</span>.
                 Efficiency (bits/Hz) is from the empirical KA2517 + mPower grid, snap-to-nearest by
@@ -4100,13 +4636,24 @@ function InterferenceTab({
                 terminals on the same satellite; utilisation % is vs an assumed 1 GHz Ka payload.
                 Above ~70% utilisation flags a satellite as resource-pressed even without interference.
               </div>
+              <div style={{marginBottom:"6px"}}>
+                <span style={{color:"#00cfff"}}>▸ Strategy comparison</span> — simulates the next N
+                minutes of constellation motion under three handover policies and shows mean MHz, mean
+                elevation, mean C/(N+I), handovers/hr, and link uptime per strategy. The MHz cost
+                difference comes from elevation: <span style={{color:"#00ff88"}}>S_BEST</span>
+                always uses the highest-EL sat → cheapest MHz; <span style={{color:"#ff6b35"}}>S_EDGE
+                </span> rides each sat to its lowest viable EL → most MHz, fewest handovers;
+                <span style={{color:"#00cfff"}}> S_MID</span> sits between. Press ▶ RUN to compute
+                results for the chosen window.
+              </div>
               <div>
                 <span style={{color:"#00cfff"}}>▸ Try it</span> — slide terminals close together (small
                 lon difference) and watch C/I collapse + red overlap appear. Then turn on 4-colour reuse
                 or narrow the beam — both should restore margin and shrink/eliminate the overlap.
                 Move terminals from equator to 40°N to see how much more MHz the same target rates
                 consume at low elevations. Push the FWD/RTN inputs higher (e.g. 32/8 Mbps) and watch
-                the satellite Σ row tip into orange utilisation.
+                the satellite Σ row tip into orange utilisation. Then press ▶ RUN on the strategy
+                panel to see how much MHz changes if you minimise handovers vs minimise spectrum.
               </div>
             </div>
           </div>
