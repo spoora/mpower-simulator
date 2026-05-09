@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback, useMemo } from "react";
+import { useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo } from "react";
 import * as d3 from "d3";
 import {
   LineChart, Line, AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip,
@@ -8,7 +8,7 @@ import {
 // ═══════════════════════════════════════════════════════════════
 // ORBITAL CONSTANTS — O3b mPOWER
 // ═══════════════════════════════════════════════════════════════
-const VERSION = "v4.21.0";
+const VERSION = "v4.21.1";
 const Re     = 6371;
 const h_orb  = 8063;
 const Rs     = Re + h_orb;
@@ -3668,7 +3668,20 @@ function InterferenceTab({
         summary[strat].costVsBest = (m != null && baseline != null) ? (m / baseline - 1) : null;
       }
 
-      setStratResults({ summary, traces: results, windowMin: stratWindowMin });
+      // Configuration snapshot — used to detect when results are stale vs live config
+      const configSnapshot = {
+        ranAtSimTime: t0,
+        terminals: interfTerminals.map(t => ({ id: t.id, lat: t.lat, lon: t.lon, label: t.label })),
+        numSats,
+        stratMinEl,
+        interfBeamHalf,
+        interfRolloffDb,
+        interfReuseEnabled,
+        interfMbpsFwd,
+        interfMbpsRtn,
+        stratWindowMin,
+      };
+      setStratResults({ summary, traces: results, windowMin: stratWindowMin, config: configSnapshot });
       setStratRunning(false);
     }, 50);
   }, [simTime, numSats, interfTerminals, stratMinEl, interfBeamHalf, interfRolloffDb,
@@ -3801,6 +3814,17 @@ function InterferenceTab({
     ctx.fillText("t = " + tMin.toFixed(0) + " min", W - 4, 12);
   }, [stratResults, interfBeamHalf]);
 
+  // ─── 4d-pre. Reset playback when new results arrive ───────────────────
+  // CRITICAL: This MUST run before any redraw so we never paint a stale frame
+  // index against new results (e.g. after second RUN with different config).
+  // useLayoutEffect runs before paint, so the redraw useEffect below sees idx=0.
+  useLayoutEffect(() => {
+    if (stratResults) {
+      setStratPlayIdx(0);
+      setStratPlaying(false);
+    }
+  }, [stratResults]);
+
   // Redraw all three mini-maps when playback index or results change
   useEffect(() => {
     if (!stratResults) return;
@@ -3825,14 +3849,6 @@ function InterferenceTab({
     }, intervalMs);
     return () => clearInterval(id);
   }, [stratPlaying, stratPlaySpeed, stratResults]);
-
-  // Reset playback index when new strategy results arrive
-  useEffect(() => {
-    if (stratResults) {
-      setStratPlayIdx(0);
-      setStratPlaying(false);
-    }
-  }, [stratResults]);
 
   // ─── 4d. Live time-series sampler ─────────────────────────────────────
   // On every simTime change (sim playing/stepping), push a new sample of the
@@ -4891,6 +4907,32 @@ function InterferenceTab({
             )}
 
             {stratResults && (() => {
+              // Detect stale results: config has changed since RUN
+              const cfg = stratResults.config || {};
+              const staleBits = [];
+              if (cfg.terminals) {
+                if (cfg.terminals.length !== interfTerminals.length) {
+                  staleBits.push("terminal count changed");
+                } else {
+                  for (let i = 0; i < interfTerminals.length; i++) {
+                    const a = cfg.terminals[i], b = interfTerminals[i];
+                    if (!a || a.id !== b.id || a.lat !== b.lat || a.lon !== b.lon) {
+                      staleBits.push("terminal " + b.label + " moved");
+                      break;
+                    }
+                  }
+                }
+              }
+              if (cfg.numSats !== numSats)               staleBits.push("numSats changed");
+              if (cfg.stratMinEl !== stratMinEl)         staleBits.push("Min EL changed");
+              if (cfg.interfBeamHalf !== interfBeamHalf) staleBits.push("beam half-width changed");
+              if (cfg.interfRolloffDb !== interfRolloffDb) staleBits.push("rolloff changed");
+              if (cfg.interfReuseEnabled !== interfReuseEnabled) staleBits.push("reuse toggled");
+              if (cfg.interfMbpsFwd !== interfMbpsFwd)   staleBits.push("FWD Mbps changed");
+              if (cfg.interfMbpsRtn !== interfMbpsRtn)   staleBits.push("RTN Mbps changed");
+              if (cfg.stratWindowMin !== stratWindowMin) staleBits.push("window changed");
+              const isStale = staleBits.length > 0;
+
               const stratMeta = {
                 BEST: { label: "S_BEST",  desc: "Always pick highest-EL viable sat (current live behaviour)", color: "#00ff88" },
                 MID:  { label: "S_MID",   desc: "Lock to current sat through mid-pass; switch only when 8°+ behind",  color: "#00cfff" },
@@ -4909,6 +4951,24 @@ function InterferenceTab({
               );
               return (
                 <>
+                  {isStale && (
+                    <div style={{background:"#3a2a14", border:"1px solid #ffb347",
+                                 borderRadius:"4px", padding:"8px 12px", marginBottom:"12px",
+                                 display:"flex", justifyContent:"space-between", alignItems:"center", gap:"10px"}}>
+                      <div style={{color:"#ffd180", fontSize:"12px", lineHeight:1.4}}>
+                        <span style={{fontWeight:"bold"}}>⚠ Results are stale.</span>&nbsp;
+                        Configuration changed since last run ({staleBits.join(", ")}).
+                        Press the button to refresh.
+                      </div>
+                      <button onClick={runStrategyComparison} disabled={stratRunning}
+                        style={{background:"#0e2645", border:"1px solid #00cfff", color:"#00cfff",
+                          padding:"4px 12px", borderRadius:"3px", cursor: stratRunning ? "wait" : "pointer",
+                          fontSize:"12px", fontFamily:"inherit", fontWeight:"bold", whiteSpace:"nowrap"}}>
+                        Re-run
+                      </button>
+                    </div>
+                  )}
+
                   {/* Three summary cards */}
                   <div style={{display:"flex", gap:"8px", marginBottom:"14px"}}>
                     {["BEST", "MID", "EDGE"].map(s => {
