@@ -8,7 +8,7 @@ import {
 // ═══════════════════════════════════════════════════════════════
 // ORBITAL CONSTANTS — O3b mPOWER
 // ═══════════════════════════════════════════════════════════════
-const VERSION = "v4.21.1";
+const VERSION = "v4.21.2";
 const Re     = 6371;
 const h_orb  = 8063;
 const Rs     = Re + h_orb;
@@ -6057,6 +6057,9 @@ export default function O3bSimulator() {
   const animRef    = useRef(null);
   const lastMs     = useRef(null);
   const simTimeRef = useRef(0);
+  // Guard against rapid double-clicks firing duplicate OpenSky /tracks/all calls.
+  // Set true while loadRealFlightTrack is in flight; further invocations no-op.
+  const trackLoadingRef = useRef(false);
 
   // ── Responsive viewport tracking ──────────────────────────
   const [vw, setVw] = useState(typeof window !== "undefined" ? window.innerWidth  : 1280);
@@ -6289,6 +6292,10 @@ export default function O3bSimulator() {
   // Fetch the actual ADS-B track for a selected flight, downsample to ~200 pts,
   // and bind origin/dest from the airport database.
   async function loadRealFlightTrack(flight) {
+    // Debounce: if a track fetch is already in flight, ignore subsequent clicks
+    // (covers both the search-results list and the recent-flights chip buttons).
+    if (trackLoadingRef.current) return;
+    trackLoadingRef.current = true;
     setRealFlightLoading(true);
     setRealFlightError(null);
     try {
@@ -6381,6 +6388,7 @@ export default function O3bSimulator() {
       setRealFlightError(msg);
     } finally {
       setRealFlightLoading(false);
+      trackLoadingRef.current = false;
     }
   }
 
