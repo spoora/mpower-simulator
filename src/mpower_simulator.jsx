@@ -8,7 +8,7 @@ import {
 // ═══════════════════════════════════════════════════════════════
 // ORBITAL CONSTANTS — O3b mPOWER
 // ═══════════════════════════════════════════════════════════════
-const VERSION = "v4.19.4";
+const VERSION = "v4.21.0";
 const Re     = 6371;
 const h_orb  = 8063;
 const Rs     = Re + h_orb;
@@ -3272,6 +3272,22 @@ function InterferenceTab({
   const [stratResults, setStratResults] = useState(null);
   const [stratRunning, setStratRunning] = useState(false);
 
+  // ── Strategy playback state ──
+  // After RUN, three small canvas maps below the cards play through the simulation.
+  // stratPlayIdx is the current step (0 .. windowMin-1). Speed in steps/sec.
+  const [stratPlayIdx, setStratPlayIdx] = useState(0);
+  const [stratPlaying, setStratPlaying] = useState(false);
+  const [stratPlaySpeed, setStratPlaySpeed] = useState(4);  // sim-min per real-second
+  const stratMapRefs = useRef({ BEST: null, MID: null, EDGE: null });
+
+  // ── Live time-series buffer for pass-evolution view ──
+  // Buffers per-terminal samples as simTime advances. Capped to liveWindowMin
+  // by oldest-first eviction. Refreshes a tick counter to trigger re-render.
+  const liveBufferRef = useRef([]); // array of { tSim, perTerm: [{ el, cni, modcod, mhzTot, satIdx }, ...] }
+  const [liveWindowMin, setLiveWindowMin] = useState(30);
+  const [liveTick, setLiveTick] = useState(0); // bumped on each new sample to trigger chart re-render
+  const lastSampledSimTimeRef = useRef(-1);
+
   // Load topojson once for this tab
   useEffect(() => {
     let cancelled = false;
@@ -3457,16 +3473,21 @@ function InterferenceTab({
       const results = {};
       for (const strat of strategies) results[strat] = {
         terminals: interfTerminals.map(t => ({
-          id: t.id, label: t.label, color: t.color,
+          id: t.id, label: t.label, color: t.color, lat: t.lat, lon: t.lon,
           mhzSamples: [],      // MHz total per step
           elSamples:  [],      // serving-sat elevation per step
-          satSamples: [],      // sat idx per step
+          satSamples: [],      // sat idx per step (chosen sat)
+          satLonSamples: [],   // chosen sat's longitude per step (for playback)
           handovers:  0,       // count of sat changes
           unviable:   0,       // count of steps with no viable sat or no MHz lookup
           cnSamples:  [],      // C/N baseline per step
           cniSamples: [],      // C/(N+I) per step (with interference from other terms)
         })),
         timeSamples: [],       // shared time axis (minutes since t0)
+        // satLonsAt[step] = [lon0, lon1, ...] for all satellites at that step time.
+        // Same across strategies (constellation motion is identical), but we store on
+        // each strategy result for ease of access during playback.
+        satLonsAt: [],
       };
 
       // Per-strategy per-terminal mutable state
@@ -3479,7 +3500,13 @@ function InterferenceTab({
       for (let step = 0; step < N_STEPS; step++) {
         const t = t0 + step * STEP_SEC;
         const tMin = step * STEP_SEC / 60;
-        for (const strat of strategies) results[strat].timeSamples.push(tMin);
+        // Constellation positions at this step (same across strategies)
+        const satLonsThisStep = [];
+        for (let s = 0; s < numSats; s++) satLonsThisStep.push(satLon(s, t, numSats));
+        for (const strat of strategies) {
+          results[strat].timeSamples.push(tMin);
+          results[strat].satLonsAt.push(satLonsThisStep);
+        }
 
         // For each strategy, decide each terminal's current sat for this step
         for (const strat of strategies) {
@@ -3559,6 +3586,7 @@ function InterferenceTab({
               result_t.mhzSamples.push(null);
               result_t.elSamples.push(null);
               result_t.satSamples.push(null);
+              result_t.satLonSamples.push(null);
               result_t.cnSamples.push(null);
               result_t.cniSamples.push(null);
               return;
@@ -3600,6 +3628,7 @@ function InterferenceTab({
             result_t.mhzSamples.push(mhzTot);
             result_t.elSamples.push(lk.chosenEl);
             result_t.satSamples.push(lk.chosenIdx);
+            result_t.satLonSamples.push(lk.chosenLon);
             result_t.cnSamples.push(cn);
             result_t.cniSamples.push(cni);
           });
@@ -3644,6 +3673,203 @@ function InterferenceTab({
     }, 50);
   }, [simTime, numSats, interfTerminals, stratMinEl, interfBeamHalf, interfRolloffDb,
       interfReuseEnabled, interfMbpsFwd, interfMbpsRtn, stratWindowMin]);
+
+
+  // ─── 4e. Strategy mini-map renderer ───────────────────────────────────
+  // Renders a small constellation map for a given strategy + playback step.
+  // Shared draw function used by all three mini-maps. Returns null (it's a
+  // helper, not a React component itself). Called from useEffect when results
+  // exist or stratPlayIdx changes.
+  const drawStrategyMiniMap = useCallback((canvas, stratKey, stepIdx) => {
+    if (!canvas || !stratResults) return;
+    const traces = stratResults.traces[stratKey];
+    if (!traces || stepIdx >= traces.satLonsAt.length) return;
+
+    const W = canvas.width;
+    const H = canvas.height;
+    const ctx = canvas.getContext("2d");
+
+    // Equirectangular-ish projection: map lon [-180, 180] → [0, W], lat [60, -60] → [0, H]
+    // Bound the lat range for better detail (mPower sub-sat is at 0; terminals likely ±40).
+    const latTop = 60, latBot = -60;
+    const lonToPx = (lon) => ((lon + 180) / 360) * W;
+    const latToPy = (lat) => ((latTop - lat) / (latTop - latBot)) * H;
+
+    // Background
+    ctx.fillStyle = "#0b1622";
+    ctx.fillRect(0, 0, W, H);
+
+    // Lat/lon grid (sparse)
+    ctx.strokeStyle = "#152237";
+    ctx.lineWidth = 0.5;
+    for (let lat = -60; lat <= 60; lat += 30) {
+      const y = latToPy(lat);
+      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
+    }
+    for (let lon = -180; lon <= 180; lon += 60) {
+      const x = lonToPx(lon);
+      ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke();
+    }
+    // Equator highlight
+    ctx.strokeStyle = "#1e3055"; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(0, latToPy(0)); ctx.lineTo(W, latToPy(0)); ctx.stroke();
+
+    // Constellation: small glyphs at sub-sat points (lat 0)
+    const satLonsHere = traces.satLonsAt[stepIdx];
+    for (let s = 0; s < satLonsHere.length; s++) {
+      const x = lonToPx(satLonsHere[s]);
+      const y = latToPy(0);
+      ctx.fillStyle = "#3a5a7a";
+      ctx.beginPath(); ctx.arc(x, y, 2, 0, Math.PI*2); ctx.fill();
+    }
+
+    // Per-terminal: pin + serving sat highlight + beam ellipse + link line
+    for (let ti = 0; ti < traces.terminals.length; ti++) {
+      const term = traces.terminals[ti];
+      const px = lonToPx(term.lon);
+      const py = latToPy(term.lat);
+
+      const satIdx = term.satSamples[stepIdx];
+      const chosenLon = term.satLonSamples[stepIdx];
+      const chosenEl = term.elSamples[stepIdx];
+
+      // Beam ellipse (only when viable)
+      if (satIdx != null && chosenLon != null && chosenEl != null) {
+        const slantKm = slantRange(chosenEl);
+        const minorKm = slantKm * Math.tan(toRad(interfBeamHalf));
+        // sin(EL) protects against div-by-zero at zenith
+        const majorKm = minorKm / Math.max(0.05, Math.sin(toRad(chosenEl)));
+        // Convert km → degrees of lat (approx: 1° lat ≈ 111 km)
+        // For lon stretching we need cos(lat) but at small footprint sizes a flat approx is fine
+        const minorDeg = minorKm / 111;
+        const majorDeg = majorKm / 111;
+        // Pixels per degree
+        const pxPerDegLon = W / 360;
+        const pxPerDegLat = H / (latTop - latBot);
+        const minorPx = minorDeg * pxPerDegLat;
+        const majorPx = majorDeg * pxPerDegLat;
+        // Orientation: roughly along terminal-to-sub-sat direction
+        const azim = azimToSubSat(term.lat, term.lon, chosenLon);
+        const angRad = toRad(90 - azim);  // map azim to canvas angle (rough)
+
+        ctx.save();
+        ctx.translate(px, py);
+        ctx.rotate(angRad);
+        ctx.strokeStyle = term.color;
+        ctx.fillStyle = term.color + "1a"; // ~10% alpha
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.ellipse(0, 0, minorPx, majorPx, 0, 0, Math.PI*2);
+        ctx.fill();
+        ctx.stroke();
+        ctx.restore();
+
+        // Highlight serving sat
+        const sx = lonToPx(chosenLon);
+        const sy = latToPy(0);
+        ctx.strokeStyle = term.color;
+        ctx.lineWidth = 1.5;
+        ctx.beginPath(); ctx.arc(sx, sy, 4, 0, Math.PI*2); ctx.stroke();
+        ctx.fillStyle = term.color;
+        ctx.beginPath(); ctx.arc(sx, sy, 1.5, 0, Math.PI*2); ctx.fill();
+
+        // Terminal-to-sat link line
+        ctx.strokeStyle = term.color + "99";
+        ctx.lineWidth = 0.8;
+        ctx.setLineDash([]);
+        ctx.beginPath(); ctx.moveTo(px, py); ctx.lineTo(sx, sy); ctx.stroke();
+      }
+
+      // Terminal pin (always rendered, on top)
+      ctx.beginPath();
+      ctx.arc(px, py, 5, 0, Math.PI*2);
+      ctx.fillStyle = term.color + "55";
+      ctx.fill();
+      ctx.beginPath();
+      ctx.arc(px, py, 2.5, 0, Math.PI*2);
+      ctx.fillStyle = term.color;
+      ctx.fill();
+      ctx.strokeStyle = "#0b1622"; ctx.lineWidth = 1;
+      ctx.stroke();
+    }
+
+    // Time label in corner
+    const tMin = traces.timeSamples[stepIdx] || 0;
+    ctx.fillStyle = "#7090b0";
+    ctx.font = "bold 10px 'Courier New'";
+    ctx.textAlign = "right";
+    ctx.fillText("t = " + tMin.toFixed(0) + " min", W - 4, 12);
+  }, [stratResults, interfBeamHalf]);
+
+  // Redraw all three mini-maps when playback index or results change
+  useEffect(() => {
+    if (!stratResults) return;
+    drawStrategyMiniMap(stratMapRefs.current.BEST, "BEST", stratPlayIdx);
+    drawStrategyMiniMap(stratMapRefs.current.MID,  "MID",  stratPlayIdx);
+    drawStrategyMiniMap(stratMapRefs.current.EDGE, "EDGE", stratPlayIdx);
+  }, [stratResults, stratPlayIdx, drawStrategyMiniMap]);
+
+  // ─── 4d-pre. Strategy playback animation ──────────────────────────────
+  // When stratPlaying is true, advances stratPlayIdx at stratPlaySpeed steps/sec
+  // (each step = 1 sim-min). Auto-loops at end. Stops when results cleared.
+  useEffect(() => {
+    if (!stratPlaying || !stratResults) return;
+    const N = stratResults.windowMin;
+    // Step every (1000 / speed) ms — speed controls sim-min per real-second.
+    const intervalMs = Math.max(40, 1000 / stratPlaySpeed);
+    const id = setInterval(() => {
+      setStratPlayIdx(prev => {
+        const next = prev + 1;
+        return next >= N ? 0 : next;
+      });
+    }, intervalMs);
+    return () => clearInterval(id);
+  }, [stratPlaying, stratPlaySpeed, stratResults]);
+
+  // Reset playback index when new strategy results arrive
+  useEffect(() => {
+    if (stratResults) {
+      setStratPlayIdx(0);
+      setStratPlaying(false);
+    }
+  }, [stratResults]);
+
+  // ─── 4d. Live time-series sampler ─────────────────────────────────────
+  // On every simTime change (sim playing/stepping), push a new sample of the
+  // current per-terminal state from `reports` into the rolling buffer.
+  // Evicts samples older than liveWindowMin from the head.
+  useEffect(() => {
+    if (simTime === lastSampledSimTimeRef.current) return;
+    lastSampledSimTimeRef.current = simTime;
+    const sample = {
+      tSim: simTime,
+      perTerm: reports.map(r => {
+        if (!r.viable) {
+          return { el: null, cni: null, modcod: null, mhzTot: null, satIdx: null };
+        }
+        const eff = r.effAtCurEl;
+        let mhzTot = null;
+        if (eff && eff.effFwd > 0 && eff.effRtn > 0) {
+          mhzTot = interfMbpsFwd / eff.effFwd + interfMbpsRtn / eff.effRtn;
+        }
+        return {
+          el: r.sat ? r.sat.el : null,
+          cni: r.cni_db,
+          modcod: r.modcod_intf ? r.modcod_intf.label : null,
+          mhzTot,
+          satIdx: r.sat ? r.sat.idx : null,
+        };
+      }),
+    };
+    const buf = liveBufferRef.current;
+    buf.push(sample);
+    // Evict oldest samples beyond window (in seconds)
+    const cutoffSim = simTime - liveWindowMin * 60;
+    while (buf.length > 0 && buf[0].tSim < cutoffSim) buf.shift();
+    // Hard cap to prevent unbounded growth
+    if (buf.length > 5000) buf.splice(0, buf.length - 5000);
+    setLiveTick(t => t + 1);
+  }, [simTime, reports, interfMbpsFwd, interfMbpsRtn, liveWindowMin]);
 
   // ─── 5. Map drawing ─────────────────────────────────────────
   const draw = useCallback(() => {
@@ -4417,6 +4643,199 @@ function InterferenceTab({
           </div>
 
 
+
+          {/* ── Live pass-evolution panel — rolling time-series of current sim ── */}
+          <div style={panelStyle}>
+            <div style={{display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:"10px"}}>
+              <div style={secStyle}>LIVE PASS EVOLUTION (last {liveWindowMin} min of sim time)</div>
+              <div style={{display:"flex", alignItems:"center", gap:"8px"}}>
+                <label style={{color:"#6088b0", fontSize:"12px"}}>Window:</label>
+                <input type="number" min="1" max="287" step="1" value={liveWindowMin}
+                  onChange={e=>setLiveWindowMin(Math.max(1, Math.min(287, parseInt(e.target.value) || 1)))}
+                  style={{background:"#0d1a2a", border:"1px solid #2e4270",
+                    color:"#00cfff", padding:"4px 8px", width:"60px",
+                    borderRadius:"3px", fontSize:"13px", fontFamily:"inherit"}}/>
+                <span style={{color:"#5a7090", fontSize:"11px"}}>min</span>
+                <button onClick={() => setLiveWindowMin(287)}
+                  style={{background:"#0d1a2a", border:"1px solid #2e4270",
+                    color:"#7090b0", padding:"4px 8px", borderRadius:"3px",
+                    cursor:"pointer", fontSize:"11px", fontFamily:"inherit"}}>1 orbit</button>
+                <button onClick={() => { liveBufferRef.current = []; setLiveTick(t => t + 1); }}
+                  style={{background:"#0d1a2a", border:"1px solid #2e4270",
+                    color:"#ff6b35", padding:"4px 10px", borderRadius:"3px",
+                    cursor:"pointer", fontSize:"11px", fontFamily:"inherit"}}>Clear</button>
+              </div>
+            </div>
+
+            {(() => {
+              const buf = liveBufferRef.current;
+              const nSamples = buf.length;
+              const heartbeatColor = nSamples > 0 ? "#00ff88" : "#5a7090";
+              const tHeadSim = nSamples > 0 ? buf[buf.length - 1].tSim : 0;
+              const tNowMin = (tHeadSim / 60).toFixed(1);
+              return (
+                <div style={{color:"#8ab0d0", fontSize:"12px", marginBottom:"12px", lineHeight:1.5}}>
+                  <span style={{display:"inline-block", width:"8px", height:"8px",
+                    borderRadius:"50%", background:heartbeatColor, marginRight:"6px",
+                    boxShadow: nSamples > 0 ? "0 0 6px " + heartbeatColor : "none"}}/>
+                  {nSamples > 0
+                    ? <>Buffered <span style={{color:"#00cfff"}}>{nSamples}</span> sample{nSamples === 1 ? "" : "s"} | sim t = <span style={{color:"#00cfff"}}>{tNowMin}</span> min | press the global play (header) to animate.</>
+                    : "No samples yet. Press the global play button in the header to start the simulation; samples will accumulate as sim time advances."}
+                </div>
+              );
+            })()}
+
+            {(() => {
+              const buf = liveBufferRef.current;
+              if (buf.length < 2) {
+                return (
+                  <div style={{color:"#5a7090", fontSize:"13px", fontStyle:"italic", padding:"20px",
+                               textAlign:"center", border:"1px dashed #2e4270", borderRadius:"3px"}}>
+                    Press ▶ in the header to start the sim. Charts will populate as the constellation moves.
+                  </div>
+                );
+              }
+              // Time axis: relative minutes from buffer start
+              const t0 = buf[0].tSim;
+              // Build per-chart datasets. Each row has t in min plus one column per terminal.
+              const elData    = buf.map(s => { const r = { t: ((s.tSim - t0) / 60) }; interfTerminals.forEach((term, i) => { r[term.label] = s.perTerm[i] ? s.perTerm[i].el : null; }); return r; });
+              const cniData   = buf.map(s => { const r = { t: ((s.tSim - t0) / 60) }; interfTerminals.forEach((term, i) => { r[term.label] = s.perTerm[i] ? s.perTerm[i].cni : null; }); return r; });
+              const mhzData   = buf.map(s => { const r = { t: ((s.tSim - t0) / 60) }; interfTerminals.forEach((term, i) => { r[term.label] = s.perTerm[i] ? s.perTerm[i].mhzTot : null; }); return r; });
+
+              // Detect MODCOD step-changes per terminal — vertical markers on the C/(N+I) chart.
+              const modcodEvents = [];
+              interfTerminals.forEach((term, i) => {
+                for (let k = 1; k < buf.length; k++) {
+                  const prev = buf[k-1].perTerm[i] ? buf[k-1].perTerm[i].modcod : null;
+                  const cur  = buf[k].perTerm[i]   ? buf[k].perTerm[i].modcod   : null;
+                  if (prev !== cur && prev != null && cur != null) {
+                    modcodEvents.push({
+                      tMin: (buf[k].tSim - t0) / 60,
+                      color: term.color, label: term.label, from: prev, to: cur,
+                    });
+                  }
+                }
+              });
+              // Detect handover events per terminal — vertical markers on the elevation chart.
+              const handoverEvents = [];
+              interfTerminals.forEach((term, i) => {
+                for (let k = 1; k < buf.length; k++) {
+                  const prev = buf[k-1].perTerm[i] ? buf[k-1].perTerm[i].satIdx : null;
+                  const cur  = buf[k].perTerm[i]   ? buf[k].perTerm[i].satIdx   : null;
+                  if (prev !== cur && prev != null && cur != null) {
+                    handoverEvents.push({
+                      tMin: (buf[k].tSim - t0) / 60, color: term.color,
+                    });
+                  }
+                }
+              });
+
+              const chartCardStyle = {
+                flex:"1 1 280px", minWidth:"280px",
+                background:"#0d1a2a", border:"1px solid #1e3055",
+                borderRadius:"3px", padding:"6px",
+              };
+
+              return (
+                <div style={{display:"flex", gap:"8px", flexWrap:"wrap"}}>
+
+                  {/* Elevation chart with handover markers */}
+                  <div style={chartCardStyle}>
+                    <div style={{display:"flex", justifyContent:"space-between", alignItems:"baseline", marginBottom:"4px"}}>
+                      <div style={{color:"#00cfff", fontSize:"11px", fontWeight:"bold"}}>ELEVATION (deg)</div>
+                      <div style={{color:"#5a7090", fontSize:"10px"}}>{handoverEvents.length} handover{handoverEvents.length === 1 ? "" : "s"}</div>
+                    </div>
+                    <ResponsiveContainer width="100%" height={150}>
+                      <LineChart data={elData} margin={{top:4, right:8, bottom:18, left:0}}>
+                        <CartesianGrid strokeDasharray="2 2" stroke="#1e3055"/>
+                        <XAxis dataKey="t" type="number" domain={[0, "dataMax"]}
+                          stroke="#2e4270" tick={{fill:"#4a6a8a", fontSize:9}}
+                          tickFormatter={v => v.toFixed(0)}
+                          label={{value:"min", position:"insideBottom", offset:-2, fill:"#4a6a8a", fontSize:9}}/>
+                        <YAxis stroke="#2e4270" tick={{fill:"#4a6a8a", fontSize:9}} domain={[0, 90]}/>
+                        <Tooltip contentStyle={{background:"#0a1421", border:"1px solid #2e4270", fontSize:11}}
+                          labelStyle={{color:"#7090b0"}} labelFormatter={v => v.toFixed(1) + " min"}/>
+                        <ReferenceLine y={ka2517MinEl} stroke="#ff6b35" strokeDasharray="4 2" strokeWidth={1}/>
+                        {handoverEvents.map((ev, ei) => (
+                          <ReferenceLine key={"h-" + ei} x={ev.tMin}
+                            stroke={ev.color} strokeOpacity={0.5} strokeWidth={1}
+                            strokeDasharray="3 2" ifOverflow="extendDomain"/>
+                        ))}
+                        {interfTerminals.map(term => (
+                          <Line key={term.id} type="monotone" dataKey={term.label}
+                            stroke={term.color} strokeWidth={1.5} dot={false}
+                            isAnimationActive={false} connectNulls={false}/>
+                        ))}
+                      </LineChart>
+                    </ResponsiveContainer>
+                  </div>
+
+                  {/* C/(N+I) chart with MODCOD step-change markers */}
+                  <div style={chartCardStyle}>
+                    <div style={{display:"flex", justifyContent:"space-between", alignItems:"baseline", marginBottom:"4px"}}>
+                      <div style={{color:"#00cfff", fontSize:"11px", fontWeight:"bold"}}>C/(N+I) (dB)</div>
+                      <div style={{color:"#5a7090", fontSize:"10px"}}>{modcodEvents.length} MODCOD shift{modcodEvents.length === 1 ? "" : "s"}</div>
+                    </div>
+                    <ResponsiveContainer width="100%" height={150}>
+                      <LineChart data={cniData} margin={{top:4, right:8, bottom:18, left:0}}>
+                        <CartesianGrid strokeDasharray="2 2" stroke="#1e3055"/>
+                        <XAxis dataKey="t" type="number" domain={[0, "dataMax"]}
+                          stroke="#2e4270" tick={{fill:"#4a6a8a", fontSize:9}}
+                          tickFormatter={v => v.toFixed(0)}
+                          label={{value:"min", position:"insideBottom", offset:-2, fill:"#4a6a8a", fontSize:9}}/>
+                        <YAxis stroke="#2e4270" tick={{fill:"#4a6a8a", fontSize:9}}/>
+                        <Tooltip contentStyle={{background:"#0a1421", border:"1px solid #2e4270", fontSize:11}}
+                          labelStyle={{color:"#7090b0"}} labelFormatter={v => v.toFixed(1) + " min"}/>
+                        {modcodEvents.map((ev, ei) => (
+                          <ReferenceLine key={"m-" + ei} x={ev.tMin}
+                            stroke={ev.color} strokeOpacity={0.4} strokeWidth={1}
+                            strokeDasharray="2 3" ifOverflow="extendDomain"/>
+                        ))}
+                        {interfTerminals.map(term => (
+                          <Line key={term.id} type="monotone" dataKey={term.label}
+                            stroke={term.color} strokeWidth={1.5} dot={false}
+                            isAnimationActive={false} connectNulls={false}/>
+                        ))}
+                      </LineChart>
+                    </ResponsiveContainer>
+                  </div>
+
+                  {/* MHz consumption chart */}
+                  <div style={chartCardStyle}>
+                    <div style={{color:"#00cfff", fontSize:"11px", fontWeight:"bold", marginBottom:"4px"}}>
+                      MHz CONSUMED ({interfMbpsFwd}/{interfMbpsRtn} Mbps)
+                    </div>
+                    <ResponsiveContainer width="100%" height={150}>
+                      <LineChart data={mhzData} margin={{top:4, right:8, bottom:18, left:0}}>
+                        <CartesianGrid strokeDasharray="2 2" stroke="#1e3055"/>
+                        <XAxis dataKey="t" type="number" domain={[0, "dataMax"]}
+                          stroke="#2e4270" tick={{fill:"#4a6a8a", fontSize:9}}
+                          tickFormatter={v => v.toFixed(0)}
+                          label={{value:"min", position:"insideBottom", offset:-2, fill:"#4a6a8a", fontSize:9}}/>
+                        <YAxis stroke="#2e4270" tick={{fill:"#4a6a8a", fontSize:9}}/>
+                        <Tooltip contentStyle={{background:"#0a1421", border:"1px solid #2e4270", fontSize:11}}
+                          labelStyle={{color:"#7090b0"}} labelFormatter={v => v.toFixed(1) + " min"}/>
+                        {interfTerminals.map(term => (
+                          <Line key={term.id} type="monotone" dataKey={term.label}
+                            stroke={term.color} strokeWidth={1.5} dot={false}
+                            isAnimationActive={false} connectNulls={false}/>
+                        ))}
+                      </LineChart>
+                    </ResponsiveContainer>
+                  </div>
+
+                </div>
+              );
+            })()}
+
+            <div style={{color:"#5a7090", fontSize:"11px", marginTop:"8px",
+                         fontStyle:"italic", lineHeight:1.4}}>
+              Solid coloured lines: per-terminal current values. Dashed coloured verticals:
+              handover events (left chart), MODCOD step-changes (middle). Dashed orange line on left:
+              ka2517MinEl threshold. Window slides forward as sim time advances; press Clear to reset.
+            </div>
+          </div>
+
           {/* ── Strategy comparison panel ── */}
           <div style={panelStyle}>
             <div style={{display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:"10px"}}>
@@ -4520,6 +4939,72 @@ function InterferenceTab({
                         </div>
                       );
                     })}
+                  </div>
+
+                  {/* ── Per-strategy mini-maps with shared playback scrubber ── */}
+                  <div style={secStyle}>STRATEGY PLAYBACK — CONSTELLATION & BEAMS OVER {stratResults.windowMin} MIN</div>
+                  <div style={{display:"flex", gap:"8px", flexWrap:"wrap", marginBottom:"8px"}}>
+                    {["BEST", "MID", "EDGE"].map(s => {
+                      const meta = stratMeta[s];
+                      return (
+                        <div key={s + "-map"} style={{flex:"1 1 280px", minWidth:"280px",
+                          background:"#0d1a2a", border:`1px solid ${meta.color}55`,
+                          borderRadius:"3px", padding:"6px"}}>
+                          <div style={{color:meta.color, fontSize:"11px", fontWeight:"bold", marginBottom:"4px"}}>
+                            {meta.label}
+                          </div>
+                          <canvas
+                            ref={el => { stratMapRefs.current[s] = el; }}
+                            width={300} height={180}
+                            style={{width:"100%", height:"180px", display:"block",
+                                    background:"#0b1622", borderRadius:"2px"}}/>
+                        </div>
+                      );
+                    })}
+                  </div>
+
+                  {/* Shared playback control bar */}
+                  <div style={{display:"flex", alignItems:"center", gap:"10px",
+                               background:"#0d1a2a", border:"1px solid #1e3055",
+                               borderRadius:"3px", padding:"8px 10px", marginBottom:"14px"}}>
+                    <button onClick={() => setStratPlaying(p => !p)}
+                      style={{background: stratPlaying ? "#3a2a14" : "#0e2645",
+                        border: `1px solid ${stratPlaying ? "#ffb347" : "#00cfff"}`,
+                        color: stratPlaying ? "#ffd180" : "#00cfff",
+                        padding:"4px 12px", borderRadius:"3px",
+                        cursor:"pointer", fontSize:"12px", fontFamily:"inherit",
+                        fontWeight:"bold", minWidth:"60px"}}>
+                      {stratPlaying ? "PAUSE" : "▶ PLAY"}
+                    </button>
+                    <button onClick={() => { setStratPlayIdx(0); setStratPlaying(false); }}
+                      style={{background:"#0d1a2a", border:"1px solid #2e4270",
+                        color:"#7090b0", padding:"4px 8px", borderRadius:"3px",
+                        cursor:"pointer", fontSize:"11px", fontFamily:"inherit"}}>⟲</button>
+                    <span style={{color:"#6088b0", fontSize:"12px", fontFamily:"'Courier New', monospace",
+                                  minWidth:"110px"}}>
+                      t = <span style={{color:"#00cfff"}}>
+                        {stratResults.traces.BEST.timeSamples[stratPlayIdx] != null
+                          ? stratResults.traces.BEST.timeSamples[stratPlayIdx].toFixed(0)
+                          : "0"}
+                      </span> / {stratResults.windowMin} min
+                    </span>
+                    <input type="range" min="0" max={stratResults.windowMin - 1} step="1"
+                      value={stratPlayIdx}
+                      onChange={e => { setStratPlayIdx(parseInt(e.target.value) || 0); setStratPlaying(false); }}
+                      style={{flex:1, accentColor:"#00cfff"}}/>
+                    <label style={{color:"#6088b0", fontSize:"12px"}}>Speed:</label>
+                    <select value={stratPlaySpeed}
+                      onChange={e => setStratPlaySpeed(parseFloat(e.target.value))}
+                      style={{background:"#0d1a2a", border:"1px solid #2e4270",
+                        color:"#00cfff", padding:"3px 6px", borderRadius:"3px",
+                        fontSize:"12px", fontFamily:"inherit"}}>
+                      <option value={1}>1x (1 min/s)</option>
+                      <option value={2}>2x</option>
+                      <option value={4}>4x</option>
+                      <option value={8}>8x</option>
+                      <option value={16}>16x</option>
+                      <option value={32}>32x</option>
+                    </select>
                   </div>
 
                   {/* Per-terminal MHz time-series — three small charts side by side */}
