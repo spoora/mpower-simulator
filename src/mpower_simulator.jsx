@@ -8,7 +8,7 @@ import {
 // ═══════════════════════════════════════════════════════════════
 // ORBITAL CONSTANTS — O3b mPOWER
 // ═══════════════════════════════════════════════════════════════
-const VERSION = "v4.19.2";
+const VERSION = "v4.19.4";
 const Re     = 6371;
 const h_orb  = 8063;
 const Rs     = Re + h_orb;
@@ -3268,7 +3268,8 @@ function InterferenceTab({
   // ── Strategy-comparison state ──
   // windowMin = duration of the analysis window (minutes); 287 ≈ one mPower orbital period
   const [stratWindowMin, setStratWindowMin] = useState(287);
-  const [stratResults, setStratResults] = useState(null); // null until "RUN" pressed
+  const [stratMinEl, setStratMinEl] = useState(5); // service threshold for strategy comparison; lower than ka2517MinEl by design
+  const [stratResults, setStratResults] = useState(null);
   const [stratRunning, setStratRunning] = useState(false);
 
   // Load topojson once for this tab
@@ -3496,7 +3497,7 @@ function InterferenceTab({
               if (st.curIdx >= 0) {
                 const curLon = satLon(st.curIdx, t, numSats);
                 const curEl = elevAngle(term.lat, term.lon, curLon);
-                if (curEl >= ka2517MinEl && (best.el - curEl) < SAT_HYS) {
+                if (curEl >= stratMinEl && (best.el - curEl) < SAT_HYS) {
                   chosenIdx = st.curIdx; chosenLon = curLon; chosenEl = curEl;
                 } else {
                   chosenIdx = best.idx; chosenLon = best.lon; chosenEl = best.el;
@@ -3505,11 +3506,11 @@ function InterferenceTab({
                 chosenIdx = best.idx; chosenLon = best.lon; chosenEl = best.el;
               }
             } else if (strat === "EDGE") {
-              // Ride current sat until it falls below ka2517MinEl, then switch to best
+              // Ride current sat until it falls below stratMinEl, then switch to best
               if (st.curIdx >= 0) {
                 const curLon = satLon(st.curIdx, t, numSats);
                 const curEl = elevAngle(term.lat, term.lon, curLon);
-                if (curEl >= ka2517MinEl) {
+                if (curEl >= stratMinEl) {
                   chosenIdx = st.curIdx; chosenLon = curLon; chosenEl = curEl;
                 } else {
                   chosenIdx = best.idx; chosenLon = best.lon; chosenEl = best.el;
@@ -3528,7 +3529,7 @@ function InterferenceTab({
                 // Switch if current sat is now below threshold OR we're descending past
                 // halfway (curEl is significantly worse than best AND not improving)
                 const significantDrop = (best.el - curEl) > 8;  // best is 8°+ better
-                if (curEl >= ka2517MinEl && !significantDrop) {
+                if (curEl >= stratMinEl && !significantDrop) {
                   chosenIdx = st.curIdx; chosenLon = curLon; chosenEl = curEl;
                 } else {
                   chosenIdx = best.idx; chosenLon = best.lon; chosenEl = best.el;
@@ -3545,7 +3546,7 @@ function InterferenceTab({
             states[ti].curIdx = chosenIdx;
             states[ti].curEl  = chosenEl;
 
-            const viable = chosenEl >= ka2517MinEl;
+            const viable = chosenEl >= stratMinEl;
             return { term, chosenIdx, chosenLon, chosenEl, viable };
           });
 
@@ -3641,7 +3642,7 @@ function InterferenceTab({
       setStratResults({ summary, traces: results, windowMin: stratWindowMin });
       setStratRunning(false);
     }, 50);
-  }, [simTime, numSats, interfTerminals, ka2517MinEl, interfBeamHalf, interfRolloffDb,
+  }, [simTime, numSats, interfTerminals, stratMinEl, interfBeamHalf, interfRolloffDb,
       interfReuseEnabled, interfMbpsFwd, interfMbpsRtn, stratWindowMin]);
 
   // ─── 5. Map drawing ─────────────────────────────────────────
@@ -4432,6 +4433,13 @@ function InterferenceTab({
                   style={{background:"#0d1a2a", border:"1px solid #2e4270",
                     color:"#7090b0", padding:"4px 8px", borderRadius:"3px",
                     cursor:"pointer", fontSize:"11px", fontFamily:"inherit"}}>1 orbit (287)</button>
+                <label style={{color:"#6088b0", fontSize:"12px", marginLeft:"6px"}}>Min EL:</label>
+                <input type="number" min="0" max="60" step="1" value={stratMinEl}
+                  onChange={e=>setStratMinEl(Math.max(0, Math.min(60, parseFloat(e.target.value) || 0)))}
+                  style={{background:"#0d1a2a", border:"1px solid #2e4270",
+                    color:"#00cfff", padding:"4px 8px", width:"55px",
+                    borderRadius:"3px", fontSize:"13px", fontFamily:"inherit"}}/>
+                <span style={{color:"#5a7090", fontSize:"11px"}}>deg</span>
                 <button onClick={runStrategyComparison} disabled={stratRunning}
                   style={{background: stratRunning ? "#1a2640" : "#0e2645",
                     border: "1px solid #00cfff", color: "#00cfff",
