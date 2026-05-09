@@ -8,7 +8,7 @@ import {
 // ═══════════════════════════════════════════════════════════════
 // ORBITAL CONSTANTS — O3b mPOWER
 // ═══════════════════════════════════════════════════════════════
-const VERSION = "v4.13.1";
+const VERSION = "v4.17.0";
 const Re     = 6371;
 const h_orb  = 8063;
 const Rs     = Re + h_orb;
@@ -2792,6 +2792,58 @@ function bwRequiredMhz(cirMbps, cnDb) {
   return Math.ceil(cirMbps / mc.eff);
 }
 
+// ─── KA2517 + mPower efficiency lookup grid ───────────────────
+// Empirical efficiencies and bandwidth requirements at reference
+// latitudes. Snap-to-nearest by latitude; covers ±40° in 2.5° steps.
+// Latitude → spectral efficiency (bits/Hz). Snap-to-nearest by latitude;
+// covers ±40° in 2.5° steps. MHz needed = Mbps / efficiency, computed at runtime.
+const KA2517_EFFICIENCY_GRID = [
+  { lat: 40.0, elEdge: 16.7, elCenter: 27.0, effFwd:0.307, effRtn:1.047 },
+  { lat: 37.5, elEdge: 18.7, elCenter: 30.6, effFwd:0.394, effRtn:1.110 },
+  { lat: 35.0, elEdge: 20.7, elCenter: 34.2, effFwd:0.482, effRtn:1.173 },
+  { lat: 32.5, elEdge: 22.7, elCenter: 37.8, effFwd:0.569, effRtn:1.237 },
+  { lat: 30.0, elEdge: 24.7, elCenter: 41.4, effFwd:0.657, effRtn:1.300 },
+  { lat: 27.5, elEdge: 26.7, elCenter: 44.9, effFwd:0.744, effRtn:1.363 },
+  { lat: 25.0, elEdge: 28.7, elCenter: 48.5, effFwd:0.832, effRtn:1.427 },
+  { lat: 22.5, elEdge: 30.7, elCenter: 52.1, effFwd:0.907, effRtn:1.483 },
+  { lat: 20.0, elEdge: 32.7, elCenter: 55.7, effFwd:0.983, effRtn:1.540 },
+  { lat: 17.5, elEdge: 33.6, elCenter: 60.0, effFwd:1.025, effRtn:1.565 },
+  { lat: 15.0, elEdge: 34.6, elCenter: 64.3, effFwd:1.066, effRtn:1.589 },
+  { lat: 12.5, elEdge: 35.5, elCenter: 68.6, effFwd:1.107, effRtn:1.614 },
+  { lat: 10.0, elEdge: 36.5, elCenter: 72.8, effFwd:1.148, effRtn:1.638 },
+  { lat:  7.5, elEdge: 37.5, elCenter: 77.1, effFwd:1.195, effRtn:1.652 },
+  { lat:  5.0, elEdge: 38.4, elCenter: 81.4, effFwd:1.241, effRtn:1.666 },
+  { lat:  2.5, elEdge: 39.4, elCenter: 85.7, effFwd:1.287, effRtn:1.680 },
+  { lat:  0.0, elEdge: 40.3, elCenter: 90.0, effFwd:1.333, effRtn:1.693 },
+  { lat: -2.5, elEdge: 39.4, elCenter: 85.7, effFwd:1.287, effRtn:1.680 },
+  { lat: -5.0, elEdge: 38.4, elCenter: 81.4, effFwd:1.241, effRtn:1.666 },
+  { lat: -7.5, elEdge: 37.5, elCenter: 77.1, effFwd:1.222, effRtn:1.652 },
+  { lat:-10.0, elEdge: 36.5, elCenter: 72.8, effFwd:1.203, effRtn:1.638 },
+  { lat:-12.5, elEdge: 35.5, elCenter: 68.6, effFwd:1.135, effRtn:1.614 },
+  { lat:-15.0, elEdge: 34.6, elCenter: 64.3, effFwd:1.066, effRtn:1.589 },
+  { lat:-17.5, elEdge: 33.6, elCenter: 60.0, effFwd:1.025, effRtn:1.565 },
+  { lat:-20.0, elEdge: 32.7, elCenter: 55.7, effFwd:0.983, effRtn:1.540 },
+  { lat:-22.5, elEdge: 30.7, elCenter: 52.1, effFwd:0.907, effRtn:1.483 },
+  { lat:-25.0, elEdge: 28.7, elCenter: 48.5, effFwd:0.832, effRtn:1.427 },
+  { lat:-27.5, elEdge: 26.7, elCenter: 44.9, effFwd:0.744, effRtn:1.363 },
+  { lat:-30.0, elEdge: 24.7, elCenter: 41.4, effFwd:0.657, effRtn:1.300 },
+  { lat:-32.5, elEdge: 22.7, elCenter: 37.8, effFwd:0.569, effRtn:1.237 },
+  { lat:-35.0, elEdge: 20.7, elCenter: 34.2, effFwd:0.482, effRtn:1.173 },
+  { lat:-37.5, elEdge: 18.7, elCenter: 30.6, effFwd:0.394, effRtn:1.110 },
+  { lat:-40.0, elEdge: 16.7, elCenter: 27.0, effFwd:0.307, effRtn:1.047 },
+];
+
+// Snap to nearest lat row; returns the entry or null if outside ±40°.
+function ka2517EfficiencyLookup(latDeg) {
+  if (Math.abs(latDeg) > 40.5) return null;
+  let best = null, bestDist = Infinity;
+  for (const r of KA2517_EFFICIENCY_GRID) {
+    const d = Math.abs(r.lat - latDeg);
+    if (d < bestDist) { bestDist = d; best = r; }
+  }
+  return best;
+}
+
 // ═══════════════════════════════════════════════════════════════
 // D3 CANVAS MAP — zoom + pan + pin-drop
 // ═══════════════════════════════════════════════════════════════
@@ -3169,6 +3221,903 @@ function GatewayManagerTab({ activeGwIds, setActiveGwIds, simTime, numSats, gwMi
 }
 
 // ─── end GatewayManagerTab ─────────────────────────────────────
+
+// ═══════════════════════════════════════════════════════════════
+// INTERFERENCE TAB COMPONENT (Wave 1.5: with map visualization)
+// ═══════════════════════════════════════════════════════════════
+function InterferenceTab({
+  simTime, numSats, satNames, activeGateways, gwMinEl, ka2517MinEl,
+  interfTerminals, setInterfTerminals,
+  interfBeamHalf, setInterfBeamHalf,
+  interfRolloffDb, setInterfRolloffDb,
+  interfReuseEnabled, setInterfReuseEnabled,
+  interfMbpsFwd, setInterfMbpsFwd,
+  interfMbpsRtn, setInterfMbpsRtn,
+  interfNextId, setInterfNextId,
+  INTERFERENCE_COLORS,
+}) {
+  const canvasRef = useRef(null);
+  const wrapRef   = useRef(null);
+  const worldRef  = useRef(null);
+  const transformRef = useRef(d3.zoomIdentity);
+  const zoomBehavRef = useRef(null);
+  const [ready, setReady] = useState(false);
+  const [zoomK, setZoomK] = useState(1);
+
+  // Load topojson once for this tab
+  useEffect(() => {
+    let cancelled = false;
+    function loadScript(src) {
+      return new Promise((res, rej) => {
+        if (document.querySelector(`script[src="${src}"]`)) { res(); return; }
+        const s = document.createElement("script");
+        s.src = src; s.onload = res; s.onerror = rej;
+        document.head.appendChild(s);
+      });
+    }
+    (async () => {
+      try {
+        await loadScript("https://cdnjs.cloudflare.com/ajax/libs/topojson/3.0.2/topojson.min.js");
+        const wd = await fetch("https://cdn.jsdelivr.net/npm/world-atlas@2/countries-110m.json").then(r => r.json());
+        if (!cancelled) { worldRef.current = wd; setReady(true); }
+      } catch (e) { /* silent fall-through; map just won't render countries */ }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  // ─── 1. Compute per-terminal active link (best sat + best GW) ──
+  const interfActiveLinks = interfTerminals.map(term => {
+    let bestSat = null, bestSatEl = -90;
+    for (let i = 0; i < numSats; i++) {
+      const sLon = satLon(i, simTime, numSats);
+      const el = elevAngle(term.lat, term.lon, sLon);
+      if (el > bestSatEl) { bestSatEl = el; bestSat = { idx: i, lon: sLon, el }; }
+    }
+    let bestGw = null, bestGwEl = -90;
+    if (bestSat) {
+      for (const gw of activeGateways) {
+        const gel = elevAngle(gw.lat, gw.lon, bestSat.lon);
+        if (gel > bestGwEl && gel >= gwMinEl) { bestGwEl = gel; bestGw = { ...gw, el: gel }; }
+      }
+    }
+    const viable = bestSat && bestSat.el >= ka2517MinEl && bestGw;
+    return { term, sat: bestSat, gw: bestGw, viable };
+  });
+
+  // ─── 2. Helper: angular sep at satellite between two terminals ──
+  const angSepAtSat = (satLonDeg, ptA, ptB) => {
+    const Rsat = Rs;
+    const lat0 = 0, lon0 = toRad(satLonDeg);
+    const sx = Rsat * Math.cos(lat0) * Math.cos(lon0);
+    const sy = Rsat * Math.cos(lat0) * Math.sin(lon0);
+    const sz = Rsat * Math.sin(lat0);
+    const ptToVec = (lat, lon) => {
+      const la = toRad(lat), lo = toRad(lon);
+      return [
+        Re * Math.cos(la) * Math.cos(lo) - sx,
+        Re * Math.cos(la) * Math.sin(lo) - sy,
+        Re * Math.sin(la) - sz
+      ];
+    };
+    const vA = ptToVec(ptA.lat, ptA.lon);
+    const vB = ptToVec(ptB.lat, ptB.lon);
+    const dot = vA[0]*vB[0] + vA[1]*vB[1] + vA[2]*vB[2];
+    const magA = Math.sqrt(vA[0]*vA[0] + vA[1]*vA[1] + vA[2]*vA[2]);
+    const magB = Math.sqrt(vB[0]*vB[0] + vB[1]*vB[1] + vB[2]*vB[2]);
+    return toDeg(Math.acos(Math.max(-1, Math.min(1, dot / (magA * magB)))));
+  };
+
+  // ─── 3. Beam roll-off ──
+  const beamRolloffDb = (thetaDeg, beamHalfDeg, rolloffDb) => {
+    const norm = thetaDeg / beamHalfDeg;
+    return Math.max(-40, -rolloffDb * norm * norm);
+  };
+
+  // ─── 4. Per-terminal C/(N+I) reports ──
+  const colorOf = (idx) => interfReuseEnabled ? (idx % 4) : 0;
+
+  const reports = interfActiveLinks.map((link, i) => {
+    if (!link.viable) {
+      // Even non-viable terminals show their MHz lookup (geographic only)
+      const eff = ka2517EfficiencyLookup(link.term.lat);
+      return { term: link.term, sat: link.sat, gw: link.gw, viable: false,
+               cn_baseline: null, cni_db: null, interferers: [],
+               modcod_base: null, modcod_intf: null, margin_db: null,
+               mhzGrid: eff };
+    }
+    const fl = linkBudgetFL(link.sat.el, true);
+    const cn_baseline = fl.C_N;
+    const modcod_base = fl.modcod;
+
+    const myColor = colorOf(i);
+    const interferers = [];
+    for (let j = 0; j < interfActiveLinks.length; j++) {
+      if (j === i) continue;
+      const other = interfActiveLinks[j];
+      if (!other.viable) continue;
+      if (other.sat.idx !== link.sat.idx) continue;
+      if (interfReuseEnabled && colorOf(j) !== myColor) continue;
+      const theta = angSepAtSat(link.sat.lon, link.term, other.term);
+      const gOffDb = beamRolloffDb(theta, interfBeamHalf, interfRolloffDb);
+      const ci_db = -gOffDb;
+      interferers.push({ idx: j, label: other.term.label, color: other.term.color,
+                         theta, gOffDb, ci_db });
+    }
+
+    const noiseRatio = Math.pow(10, -cn_baseline / 10);
+    let intfRatio = 0;
+    for (const k of interferers) intfRatio += Math.pow(10, -k.ci_db / 10);
+    const cni_db = -10 * Math.log10(noiseRatio + intfRatio);
+
+    const modcod_intf = dvbS2xModcod(cni_db);
+    const margin_db = modcod_intf ? (cni_db - modcod_intf.minCN) : null;
+
+    // Look up MHz needed for this terminal's latitude (snap-to-nearest)
+    const mhzGrid = ka2517EfficiencyLookup(link.term.lat);
+
+    return { term: link.term, sat: link.sat, gw: link.gw, viable: true,
+             cn_baseline, cni_db, interferers,
+             modcod_base, modcod_intf, margin_db,
+             mhzGrid };
+  });
+
+  // ─── 5. Map drawing ─────────────────────────────────────────
+  const draw = useCallback(() => {
+    const canvas = canvasRef.current;
+    const wrap = wrapRef.current;
+    if (!canvas || !wrap) return;
+    const W = wrap.clientWidth;
+    const H = 380;
+    canvas.width = W;
+    canvas.height = H;
+    canvas.style.width = "100%";
+    canvas.style.height = H + "px";
+
+    const ctx = canvas.getContext("2d");
+    // Build zoom-adjusted projection
+    const baseProj = d3.geoEquirectangular().fitSize([W, H], { type: "Sphere" });
+    const baseScale = baseProj.scale();
+    const baseTrans = baseProj.translate();
+    const t = transformRef.current;
+    const proj = d3.geoEquirectangular()
+      .scale(baseScale * t.k)
+      .translate([t.x + baseTrans[0] * t.k, t.y + baseTrans[1] * t.k]);
+    const path = d3.geoPath(proj, ctx);
+
+    // Background
+    ctx.fillStyle = "#0b1622";
+    ctx.fillRect(0, 0, W, H);
+
+    // Sphere outline
+    ctx.beginPath(); path({ type:"Sphere" });
+    ctx.strokeStyle = "#1e3055"; ctx.lineWidth = 1; ctx.stroke();
+
+    // Graticule
+    ctx.beginPath(); path(d3.geoGraticule()());
+    ctx.strokeStyle = "#0d1b2e"; ctx.lineWidth = 0.4; ctx.stroke();
+
+    // Countries
+    if (worldRef.current && window.topojson) {
+      const topo = window.topojson;
+      const land = topo.feature(worldRef.current, worldRef.current.objects.countries);
+      ctx.beginPath(); path(land);
+      ctx.fillStyle = "#13243d"; ctx.fill();
+      ctx.strokeStyle = "#1e3055"; ctx.lineWidth = 0.5; ctx.stroke();
+    }
+
+    // ─── Satellites ──
+    for (let i = 0; i < numSats; i++) {
+      const sLon = satLon(i, simTime, numSats);
+      const [px, py] = proj([sLon, 0]) || [0, 0];
+      ctx.beginPath();
+      ctx.arc(px, py, 5, 0, Math.PI * 2);
+      ctx.fillStyle = "#00cfff";
+      ctx.fill();
+      ctx.strokeStyle = "#0d1a2a"; ctx.lineWidth = 1.5; ctx.stroke();
+      // sat label
+      ctx.fillStyle = "#7090b0";
+      ctx.font = "10px 'Courier New'";
+      ctx.textAlign = "center";
+      ctx.fillText("mP-" + (i+1), px, py - 8);
+    }
+
+    // ─── Active gateways ──
+    for (const gw of activeGateways) {
+      const [px, py] = proj([gw.lon, gw.lat]) || [0, 0];
+      ctx.beginPath();
+      ctx.moveTo(px - 4, py); ctx.lineTo(px, py - 4);
+      ctx.lineTo(px + 4, py); ctx.lineTo(px, py + 4); ctx.closePath();
+      ctx.fillStyle = "#ffd700"; ctx.fill();
+      ctx.strokeStyle = "#0d1a2a"; ctx.lineWidth = 1; ctx.stroke();
+    }
+
+    // ─── Beam footprints (drawn first as semi-transparent fills, ──
+    //     then overlay borders + overlap hatching on top so highlights stay visible)
+    // Footprint geometry: minor axis (km) = slantRange(EL) * tan(beamHalf),
+    // major axis = minor / sin(EL); orient along the azimuth toward sub-sat.
+    const drawFootprint = (link, fillStyle, strokeStyle, dash) => {
+      if (!link.viable || !link.sat) return null;
+      const elDeg = link.sat.el;
+      const slKm = slantRange(elDeg);                 // ground-to-sat
+      const minorKm = slKm * Math.tan(toRad(interfBeamHalf));
+      const majorKm = minorKm / Math.sin(toRad(elDeg));
+      const az = azimToSubSat(link.term.lat, link.term.lon, link.sat.lon);
+
+      // Build ellipse polygon in lat/lon space (~1° = 111 km)
+      // We'll build with N points, project each to canvas, draw a path
+      const N = 72;
+      const pts = [];
+      const cosLat = Math.cos(toRad(link.term.lat));
+      // Convert km radii to degrees roughly
+      const minorDegLat = minorKm / 111;
+      const majorDegLat = majorKm / 111;
+      const cosAz = Math.cos(toRad(az)), sinAz = Math.sin(toRad(az));
+      for (let i = 0; i < N; i++) {
+        const t = (i / N) * 2 * Math.PI;
+        // Local frame: x = minor (perpendicular to az), y = major (along az toward sub-sat)
+        const lx = minorDegLat * Math.cos(t);
+        const ly = majorDegLat * Math.sin(t);
+        // Rotate by az (clockwise from north)
+        const dLat =  ly * cosAz - lx * sinAz;
+        const dLon = (ly * sinAz + lx * cosAz) / cosLat;
+        pts.push([link.term.lon + dLon, link.term.lat + dLat]);
+      }
+      // Render as polygon
+      ctx.beginPath();
+      pts.forEach(([lon, lat], i) => {
+        const xy = proj([lon, lat]);
+        if (!xy) return;
+        if (i === 0) ctx.moveTo(xy[0], xy[1]);
+        else         ctx.lineTo(xy[0], xy[1]);
+      });
+      ctx.closePath();
+      if (fillStyle) { ctx.fillStyle = fillStyle; ctx.fill(); }
+      if (strokeStyle) {
+        ctx.strokeStyle = strokeStyle; ctx.lineWidth = 1.5;
+        if (dash) ctx.setLineDash(dash); else ctx.setLineDash([]);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+      return pts;
+    };
+
+    // Compute and store footprint polygons for overlap detection
+    const footprints = interfActiveLinks.map(link => {
+      const fillCol = link.term.color + "22"; // 13% alpha
+      drawFootprint(link, fillCol, link.term.color + "aa", null);
+      return link;
+    });
+
+    // ─── Overlap hatching for interfering pairs ──
+    // Pixel-space approximation: draw red diagonal stripes inside the bounding region
+    // where two ellipses overlap. Cheap method: rasterize each footprint to a small offscreen,
+    // intersect them. For a simpler approach, we'll fill the smaller intersection bbox
+    // with a hatched pattern and check pair-by-pair if they're interfering.
+    for (let i = 0; i < footprints.length; i++) {
+      for (let j = i + 1; j < footprints.length; j++) {
+        const A = footprints[i], B = footprints[j];
+        if (!A.viable || !B.viable) continue;
+        if (A.sat.idx !== B.sat.idx) continue;
+        if (interfReuseEnabled && colorOf(i) !== colorOf(j)) continue;
+
+        // Re-build polygons in screen coords for both
+        const buildPoly = (link) => {
+          const elDeg = link.sat.el;
+          const slKm = slantRange(elDeg);
+          const minorKm = slKm * Math.tan(toRad(interfBeamHalf));
+          const majorKm = minorKm / Math.sin(toRad(elDeg));
+          const az = azimToSubSat(link.term.lat, link.term.lon, link.sat.lon);
+          const N = 72;
+          const cosLat = Math.cos(toRad(link.term.lat));
+          const minorDegLat = minorKm / 111;
+          const majorDegLat = majorKm / 111;
+          const cosAz = Math.cos(toRad(az)), sinAz = Math.sin(toRad(az));
+          const pts = [];
+          for (let i = 0; i < N; i++) {
+            const t = (i / N) * 2 * Math.PI;
+            const lx = minorDegLat * Math.cos(t);
+            const ly = majorDegLat * Math.sin(t);
+            const dLat = ly * cosAz - lx * sinAz;
+            const dLon = (ly * sinAz + lx * cosAz) / cosLat;
+            pts.push(proj([link.term.lon + dLon, link.term.lat + dLat]));
+          }
+          return pts.filter(p => p);
+        };
+
+        const polyA = buildPoly(A);
+        const polyB = buildPoly(B);
+        if (polyA.length < 3 || polyB.length < 3) continue;
+
+        // Point-in-polygon test
+        const pip = (poly, x, y) => {
+          let inside = false;
+          for (let m = 0, n = poly.length - 1; m < poly.length; n = m++) {
+            const [xm, ym] = poly[m], [xn, yn] = poly[n];
+            const intersect = ((ym > y) !== (yn > y)) &&
+              (x < (xn - xm) * (y - ym) / (yn - ym) + xm);
+            if (intersect) inside = !inside;
+          }
+          return inside;
+        };
+
+        // Compute bounding box of both polys to bound hatch region
+        const allPts = [...polyA, ...polyB];
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+        for (const [x,y] of allPts) {
+          if (x < minX) minX = x; if (y < minY) minY = y;
+          if (x > maxX) maxX = x; if (y > maxY) maxY = y;
+        }
+
+        // Draw diagonal stripes in the intersection region
+        ctx.save();
+        ctx.strokeStyle = "#ff444088";
+        ctx.lineWidth = 1.5;
+        const step = 5;
+        for (let d = minX - (maxY-minY); d < maxX; d += step) {
+          // diagonal from (d, minY) going down-right with slope 1
+          const path = [];
+          for (let y = minY; y <= maxY; y += 2) {
+            const x = d + (y - minY);
+            if (x < minX || x > maxX) continue;
+            if (pip(polyA, x, y) && pip(polyB, x, y)) path.push([x, y]);
+          }
+          if (path.length > 1) {
+            ctx.beginPath();
+            for (let m = 0; m < path.length - 1; m++) {
+              if (m === 0) ctx.moveTo(path[m][0], path[m][1]);
+              ctx.lineTo(path[m+1][0], path[m+1][1]);
+            }
+            ctx.stroke();
+          }
+        }
+        ctx.restore();
+      }
+    }
+
+    // ─── Active link lines: terminal → sat → gateway ──
+    for (const link of interfActiveLinks) {
+      if (!link.viable) continue;
+      const [tx, ty] = proj([link.term.lon, link.term.lat]) || [0, 0];
+      const [sx, sy] = proj([link.sat.lon, 0]) || [0, 0];
+      ctx.strokeStyle = link.term.color + "cc";
+      ctx.lineWidth = 1.5;
+      ctx.setLineDash([]);
+      ctx.beginPath();
+      ctx.moveTo(tx, ty); ctx.lineTo(sx, sy);
+      ctx.stroke();
+      // sat → gateway
+      if (link.gw) {
+        const [gx, gy] = proj([link.gw.lon, link.gw.lat]) || [0, 0];
+        ctx.strokeStyle = link.term.color + "66";
+        ctx.lineWidth = 1;
+        ctx.setLineDash([3, 3]);
+        ctx.beginPath();
+        ctx.moveTo(sx, sy); ctx.lineTo(gx, gy);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+    }
+
+    // ─── Terminal pins + MHz labels (computed from current FWD/RTN rates) ──
+    for (const link of interfActiveLinks) {
+      const [px, py] = proj([link.term.lon, link.term.lat]) || [0, 0];
+      // outer halo
+      ctx.beginPath();
+      ctx.arc(px, py, 8, 0, Math.PI*2);
+      ctx.fillStyle = link.term.color + "33";
+      ctx.fill();
+      // inner pin
+      ctx.beginPath();
+      ctx.arc(px, py, 4, 0, Math.PI*2);
+      ctx.fillStyle = link.term.color;
+      ctx.fill();
+      ctx.strokeStyle = "#0b1622"; ctx.lineWidth = 1.5; ctx.stroke();
+      // label (terminal name + MHz needed for current rates)
+      const eff = ka2517EfficiencyLookup(link.term.lat);
+      const mhzFwd = (eff && eff.effFwd > 0) ? interfMbpsFwd / eff.effFwd : null;
+      const mhzRtn = (eff && eff.effRtn > 0) ? interfMbpsRtn / eff.effRtn : null;
+      const mhzTot = (mhzFwd != null && mhzRtn != null) ? mhzFwd + mhzRtn : null;
+      ctx.fillStyle = link.term.color;
+      ctx.font = "bold 11px 'Courier New'";
+      ctx.textAlign = "left";
+      ctx.fillText(link.term.label, px + 9, py - 2);
+      if (mhzTot != null) {
+        ctx.fillStyle = "#ffffffcc";
+        ctx.font = "10px 'Courier New'";
+        ctx.fillText(mhzTot.toFixed(1) + " MHz @ " + interfMbpsFwd + "/" + interfMbpsRtn,
+                     px + 9, py + 10);
+      } else {
+        ctx.fillStyle = "#5a7090";
+        ctx.font = "italic 10px 'Courier New'";
+        ctx.fillText("(out of grid range)", px + 9, py + 10);
+      }
+    }
+  }, [simTime, numSats, interfTerminals, interfBeamHalf, interfRolloffDb,
+      interfReuseEnabled, interfMbpsFwd, interfMbpsRtn,
+      activeGateways, gwMinEl, ka2517MinEl, ready]);
+
+  useEffect(() => { draw(); }, [draw]);
+
+  // Redraw on window resize
+  useEffect(() => {
+    const onResize = () => draw();
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, [draw]);
+
+  // ─── 5b. Zoom & pan: d3.zoom on the wrapper, drives transformRef ──
+  useEffect(() => {
+    if (!wrapRef.current) return;
+    const zoom = d3.zoom()
+      .scaleExtent([1, 20])
+      .on("zoom", (event) => {
+        transformRef.current = event.transform;
+        setZoomK(+event.transform.k.toFixed(2));
+        draw();
+      });
+    zoomBehavRef.current = zoom;
+    d3.select(wrapRef.current).call(zoom);
+    // Disable double-click zoom (so it doesn't accidentally fire) — optional
+    d3.select(wrapRef.current).on("dblclick.zoom", null);
+  }, [draw, ready]);
+
+  // Zoom-control button handlers
+  const zoomIn = () => {
+    if (!zoomBehavRef.current || !wrapRef.current) return;
+    d3.select(wrapRef.current).transition().duration(200)
+      .call(zoomBehavRef.current.scaleBy, 1.5);
+  };
+  const zoomOut = () => {
+    if (!zoomBehavRef.current || !wrapRef.current) return;
+    d3.select(wrapRef.current).transition().duration(200)
+      .call(zoomBehavRef.current.scaleBy, 1/1.5);
+  };
+  const resetView = () => {
+    if (!zoomBehavRef.current || !wrapRef.current) return;
+    d3.select(wrapRef.current).transition().duration(300)
+      .call(zoomBehavRef.current.transform, d3.zoomIdentity);
+  };
+  const centerOnTerminals = () => {
+    if (!zoomBehavRef.current || !wrapRef.current || interfTerminals.length === 0) return;
+    const wrap = wrapRef.current;
+    const W = wrap.clientWidth, H = 380;
+    // Compute bounding box of terminals
+    let minLat = Infinity, maxLat = -Infinity, minLon = Infinity, maxLon = -Infinity;
+    for (const t of interfTerminals) {
+      if (t.lat < minLat) minLat = t.lat; if (t.lat > maxLat) maxLat = t.lat;
+      if (t.lon < minLon) minLon = t.lon; if (t.lon > maxLon) maxLon = t.lon;
+    }
+    // Add a margin so footprints aren't clipped
+    const margin = Math.max(8, interfBeamHalf * 4);
+    minLat -= margin; maxLat += margin; minLon -= margin; maxLon += margin;
+    // Target a projection that fits this bbox
+    const baseProj = d3.geoEquirectangular().fitSize([W, H], { type: "Sphere" });
+    const baseScale = baseProj.scale();
+    const baseTrans = baseProj.translate();
+    const [x1, y1] = baseProj([minLon, maxLat]);
+    const [x2, y2] = baseProj([maxLon, minLat]);
+    const dx = x2 - x1, dy = y2 - y1;
+    const k = Math.min(20, Math.max(1, 0.9 / Math.max(dx/W, dy/H)));
+    const cx = (x1 + x2) / 2;
+    const cy = (y1 + y2) / 2;
+    const tx = W/2 - k * cx;
+    const ty = H/2 - k * cy;
+    const newTransform = d3.zoomIdentity.translate(tx, ty).scale(k);
+    d3.select(wrapRef.current).transition().duration(300)
+      .call(zoomBehavRef.current.transform, newTransform);
+  };
+
+  // ─── 6. UI ──────────────────────────────────────────────────
+  const addTerminal = () => {
+    if (interfTerminals.length >= 5) return;
+    const newId = interfNextId;
+    const color = INTERFERENCE_COLORS[interfTerminals.length % INTERFERENCE_COLORS.length];
+    const a = interfTerminals[0] || { lat: 40, lon: -74 };
+    const newT = { id: newId, lat: a.lat + 0.5, lon: a.lon + 1.0,
+                   label: "Terminal " + String.fromCharCode(64 + newId), color };
+    setInterfTerminals([...interfTerminals, newT]);
+    setInterfNextId(newId + 1);
+  };
+  const removeTerminal = (id) => {
+    if (interfTerminals.length <= 2) return;
+    setInterfTerminals(interfTerminals.filter(t => t.id !== id));
+  };
+  const updateTerminal = (id, patch) => {
+    setInterfTerminals(interfTerminals.map(t => t.id === id ? {...t, ...patch} : t));
+  };
+
+  const tableTd = {padding:"6px 10px", borderBottom:"1px solid #1a2640", fontFamily:"'Courier New', monospace", fontSize:"14px"};
+  const tableTh = {...tableTd, color:"#7090b0", fontSize:"12px", textAlign:"left", letterSpacing:"0.05em"};
+  const panelStyle = {background:"#080f1a", border:"1px solid #1e3055", borderRadius:"4px", padding:"12px", marginBottom:"10px"};
+  const secStyle = {color:"#7090b0", fontSize:"13px", marginBottom:"8px", letterSpacing:"0.06em"};
+
+  return (
+    <div>
+      {/* ── Header note ── */}
+      <div style={{...panelStyle, background:"#0d1a2a"}}>
+        <div style={{color:"#00cfff", fontSize:"15px", marginBottom:"6px", letterSpacing:"0.05em"}}>
+          ▣ INTERFERENCE — STATIC ANALYSIS (Wave 1)
+        </div>
+        <div style={{color:"#8ab0d0", fontSize:"13px", lineHeight:1.5}}>
+          Manually-placed terminals share the constellation. When two or more terminals are served by the
+          same satellite (and same frequency-reuse colour, if reuse is enabled), the satellite's
+          spot-beam pattern projects energy from one terminal's beam onto another. This tab computes
+          the resulting C/(N+I) on the forward link for each terminal, given an idealised parabolic
+          beam roll-off model.
+        </div>
+      </div>
+
+      {/* ── Map (live, redraws on every state change) ── */}
+      <div style={panelStyle}>
+        <div style={{display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:"8px"}}>
+          <div style={secStyle}>
+            BEAM-FOOTPRINT MAP — solid ellipse = terminal's spot beam · red hatching = co-channel overlap
+          </div>
+          <div style={{color:"#5a7090", fontSize:"11px", fontStyle:"italic"}}>
+            scroll = zoom · drag = pan · {zoomK.toFixed(1)}×
+          </div>
+        </div>
+        <div ref={wrapRef} style={{position:"relative", width:"100%", overflow:"hidden", borderRadius:"3px", cursor:"grab"}}>
+          <canvas ref={canvasRef} style={{display:"block"}}/>
+          {/* Zoom-control buttons overlaid in the corner */}
+          <div style={{
+            position:"absolute", top:"8px", right:"8px",
+            display:"flex", flexDirection:"column", gap:"4px",
+          }}>
+            <button onClick={zoomIn} title="Zoom in"
+              style={{width:"30px", height:"30px", background:"#0d1a2acc", border:"1px solid #2e4270",
+                color:"#8ab0d0", borderRadius:"3px", cursor:"pointer", fontSize:"18px",
+                fontFamily:"monospace", lineHeight:1, padding:0}}>+</button>
+            <button onClick={zoomOut} title="Zoom out"
+              style={{width:"30px", height:"30px", background:"#0d1a2acc", border:"1px solid #2e4270",
+                color:"#8ab0d0", borderRadius:"3px", cursor:"pointer", fontSize:"18px",
+                fontFamily:"monospace", lineHeight:1, padding:0}}>−</button>
+            <button onClick={centerOnTerminals} title="Frame all terminals"
+              style={{width:"30px", height:"30px", background:"#0d1a2acc", border:"1px solid #2e4270",
+                color:"#00cfff", borderRadius:"3px", cursor:"pointer", fontSize:"12px",
+                fontFamily:"monospace", lineHeight:1, padding:0}}>[o]</button>
+            <button onClick={resetView} title="Reset view"
+              style={{width:"30px", height:"30px", background:"#0d1a2acc", border:"1px solid #2e4270",
+                color:"#8ab0d0", borderRadius:"3px", cursor:"pointer", fontSize:"11px",
+                fontFamily:"monospace", lineHeight:1, padding:0}}>[ ]</button>
+          </div>
+        </div>
+        <div style={{color:"#5a7090", fontSize:"11px", marginTop:"6px", fontStyle:"italic"}}>
+          Beam shapes scale with satellite elevation: low elevation = elongated footprint along the
+          azimuth toward the sub-satellite point. Adjust beam half-width below to see footprints
+          shrink/expand in real time.
+        </div>
+      </div>
+
+      <div style={{display:"grid", gridTemplateColumns:"320px 1fr", gap:"10px"}}>
+
+        {/* ── Left column: terminal management + knobs ── */}
+        <div>
+
+          <div style={panelStyle}>
+            <div style={secStyle}>TERMINALS ({interfTerminals.length}/5)</div>
+            {interfTerminals.map((t, idx) => (
+              <div key={t.id} style={{
+                marginBottom:"8px", padding:"8px", background:"#0d1a2a",
+                border:`1px solid ${t.color}55`, borderRadius:"3px"
+              }}>
+                <div style={{display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:"4px"}}>
+                  <span style={{color:t.color, fontSize:"14px", fontWeight:"bold"}}>● {t.label}</span>
+                  {interfTerminals.length > 2 && (
+                    <button onClick={()=>removeTerminal(t.id)}
+                      style={{background:"transparent", border:"1px solid #2e4270",
+                        color:"#ff6b35", padding:"1px 6px", fontSize:"12px",
+                        borderRadius:"2px", cursor:"pointer"}}>✕</button>
+                  )}
+                </div>
+                <div style={{display:"grid", gridTemplateColumns:"1fr 1fr", gap:"4px"}}>
+                  <div>
+                    <label style={{color:"#6088b0", fontSize:"11px", display:"block"}}>LAT</label>
+                    <input type="number" step="0.1" value={t.lat.toFixed(2)}
+                      onChange={e=>updateTerminal(t.id, {lat: parseFloat(e.target.value) || 0})}
+                      style={{background:"#0d1a2a", border:"1px solid #2e4270",
+                        color:"#00cfff", padding:"3px 6px", width:"100%", boxSizing:"border-box",
+                        borderRadius:"2px", fontSize:"13px", fontFamily:"inherit"}}/>
+                  </div>
+                  <div>
+                    <label style={{color:"#6088b0", fontSize:"11px", display:"block"}}>LON</label>
+                    <input type="number" step="0.1" value={t.lon.toFixed(2)}
+                      onChange={e=>updateTerminal(t.id, {lon: parseFloat(e.target.value) || 0})}
+                      style={{background:"#0d1a2a", border:"1px solid #2e4270",
+                        color:"#00cfff", padding:"3px 6px", width:"100%", boxSizing:"border-box",
+                        borderRadius:"2px", fontSize:"13px", fontFamily:"inherit"}}/>
+                  </div>
+                </div>
+              </div>
+            ))}
+            {interfTerminals.length < 5 && (
+              <button onClick={addTerminal}
+                style={{width:"100%", marginTop:"4px", background:"#0d1a2a",
+                  border:"1px dashed #2e4270", color:"#00cfff", padding:"6px",
+                  borderRadius:"3px", cursor:"pointer", fontSize:"13px", fontFamily:"inherit"}}>
+                + ADD TERMINAL
+              </button>
+            )}
+          </div>
+
+          <div style={panelStyle}>
+            <div style={secStyle}>BEAM MODEL</div>
+            <div style={{marginBottom:"10px"}}>
+              <label style={{color:"#6088b0", fontSize:"12px", display:"block", marginBottom:"3px"}}>
+                Spot beam half-width (deg, at sat) — current: {interfBeamHalf.toFixed(2)}°
+              </label>
+              <input type="range" min="0.2" max="2.0" step="0.1" value={interfBeamHalf}
+                onChange={e=>setInterfBeamHalf(parseFloat(e.target.value))}
+                style={{width:"100%"}}/>
+            </div>
+            <div style={{marginBottom:"10px"}}>
+              <label style={{color:"#6088b0", fontSize:"12px", display:"block", marginBottom:"3px"}}>
+                Roll-off at 1×beam-half (dB) — current: {interfRolloffDb} dB
+              </label>
+              <input type="range" min="10" max="40" step="1" value={interfRolloffDb}
+                onChange={e=>setInterfRolloffDb(parseFloat(e.target.value))}
+                style={{width:"100%"}}/>
+            </div>
+            <div>
+              <label style={{color:"#6088b0", fontSize:"12px", display:"flex", alignItems:"center", gap:"6px"}}>
+                <input type="checkbox" checked={interfReuseEnabled}
+                  onChange={e=>setInterfReuseEnabled(e.target.checked)}/>
+                4-colour frequency reuse
+              </label>
+              <div style={{color:"#5a7090", fontSize:"11px", marginTop:"3px", marginLeft:"22px"}}>
+                {interfReuseEnabled ? "Terminals on different colours don't interfere"
+                                    : "All terminals share the same channel"}
+              </div>
+            </div>
+          </div>
+
+          {/* ── Traffic profile (user-configurable FWD/RTN Mbps) ── */}
+          <div style={panelStyle}>
+            <div style={secStyle}>TRAFFIC PROFILE (Mbps)</div>
+            <div style={{display:"grid", gridTemplateColumns:"1fr 1fr", gap:"8px", marginBottom:"8px"}}>
+              <div>
+                <label style={{color:"#6088b0", fontSize:"12px", display:"block", marginBottom:"3px"}}>
+                  FWD (downlink)
+                </label>
+                <input type="number" min="0.1" step="0.5" value={interfMbpsFwd}
+                  onChange={e=>setInterfMbpsFwd(Math.max(0.1, parseFloat(e.target.value) || 0.1))}
+                  style={{background:"#0d1a2a", border:"1px solid #2e4270",
+                    color:"#00cfff", padding:"5px 8px", width:"100%", boxSizing:"border-box",
+                    borderRadius:"3px", fontSize:"14px", fontFamily:"inherit", fontWeight:"bold"}}/>
+              </div>
+              <div>
+                <label style={{color:"#6088b0", fontSize:"12px", display:"block", marginBottom:"3px"}}>
+                  RTN (uplink)
+                </label>
+                <input type="number" min="0.1" step="0.5" value={interfMbpsRtn}
+                  onChange={e=>setInterfMbpsRtn(Math.max(0.1, parseFloat(e.target.value) || 0.1))}
+                  style={{background:"#0d1a2a", border:"1px solid #2e4270",
+                    color:"#00cfff", padding:"5px 8px", width:"100%", boxSizing:"border-box",
+                    borderRadius:"3px", fontSize:"14px", fontFamily:"inherit", fontWeight:"bold"}}/>
+              </div>
+            </div>
+            {/* Quick-set presets */}
+            <div style={{display:"flex", gap:"4px", marginBottom:"6px", flexWrap:"wrap"}}>
+              {[[16,4], [32,6], [52,8], [100,20]].map(([f, r]) => {
+                const active = interfMbpsFwd === f && interfMbpsRtn === r;
+                return (
+                  <button key={`${f}-${r}`}
+                    onClick={() => { setInterfMbpsFwd(f); setInterfMbpsRtn(r); }}
+                    style={{
+                      flex:"1 0 auto", padding:"4px 8px", borderRadius:"3px", cursor:"pointer",
+                      fontSize:"11px", fontFamily:"inherit",
+                      background: active ? "#0e2645" : "#0d1a2a",
+                      border: `1px solid ${active ? "#00cfff" : "#2e4270"}`,
+                      color: active ? "#00cfff" : "#7090b0",
+                    }}>
+                    {f}/{r}
+                  </button>
+                );
+              })}
+            </div>
+            <div style={{color:"#8ab0d0", fontSize:"11px", lineHeight:1.4}}>
+              MHz needed per terminal = Mbps / efficiency, where efficiency (bits/Hz) is from the
+              empirical KA2517 + mPower grid (snap-to-nearest latitude, ±40°).
+            </div>
+          </div>
+
+        </div>
+
+        {/* ── Right column: report tables ── */}
+        <div>
+
+          <div style={panelStyle}>
+            <div style={secStyle}>PER-TERMINAL FORWARD-LINK RESULTS</div>
+            {(() => {
+              // MHz needed = Mbps / efficiency. Compute per terminal from current rates.
+              const mhzFor = (eff, fwd) => eff && eff > 0 ? (fwd / eff) : null;
+              // Per-satellite totals, indexed by sat idx
+              const satMhzTotals = new Map();
+              for (const r of reports) {
+                if (!r.mhzGrid || r.sat == null) continue;
+                const fwd = mhzFor(r.mhzGrid.effFwd, interfMbpsFwd);
+                const rtn = mhzFor(r.mhzGrid.effRtn, interfMbpsRtn);
+                if (fwd == null || rtn == null) continue;
+                const k = r.sat.idx;
+                const cur = satMhzTotals.get(k) || { sat: r.sat, fwd: 0, rtn: 0, tot: 0, count: 0 };
+                cur.fwd += fwd;
+                cur.rtn += rtn;
+                cur.tot += fwd + rtn;
+                cur.count += 1;
+                satMhzTotals.set(k, cur);
+              }
+              const SAT_PAYLOAD_MHZ = 1000; // approximate Ka payload (1 GHz); used for utilisation %
+              return (
+                <table style={{width:"100%", borderCollapse:"collapse"}}>
+                  <thead>
+                    <tr style={{background:"#0d1a2a"}}>
+                      <th style={tableTh}>TERMINAL</th>
+                      <th style={tableTh}>ACTIVE SAT</th>
+                      <th style={tableTh}>EL°</th>
+                      <th style={tableTh}>GW</th>
+                      <th style={tableTh}>BASELINE C/N</th>
+                      <th style={tableTh}>C/(N+I)</th>
+                      <th style={tableTh}>ΔdB</th>
+                      <th style={tableTh}>MODCOD (W/INTF)</th>
+                      <th style={tableTh}>MARGIN</th>
+                      <th style={tableTh}>MHz FWD ({interfMbpsFwd} Mbps)</th>
+                      <th style={tableTh}>MHz RTN ({interfMbpsRtn} Mbps)</th>
+                      <th style={tableTh}>MHz TOT</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {reports.map((r, i) => {
+                      const delta = (r.cni_db != null && r.cn_baseline != null) ? (r.cni_db - r.cn_baseline) : null;
+                      const deltaColor = delta == null ? "#7090b0" : delta > -0.5 ? "#00ff88" : delta > -3 ? "#ffd700" : "#ff6b35";
+                      const marginColor = r.margin_db == null ? "#ff6b35" : r.margin_db < 1 ? "#ff6b35" : r.margin_db < 3 ? "#ffd700" : "#00ff88";
+                      const mhzFwd = r.mhzGrid && r.mhzGrid.effFwd > 0 ? interfMbpsFwd / r.mhzGrid.effFwd : null;
+                      const mhzRtn = r.mhzGrid && r.mhzGrid.effRtn > 0 ? interfMbpsRtn / r.mhzGrid.effRtn : null;
+                      const mhzTot = (mhzFwd != null && mhzRtn != null) ? mhzFwd + mhzRtn : null;
+                      // Color total by magnitude
+                      const mhzColor = mhzTot == null ? "#7090b0" : mhzTot < 30 ? "#00ff88" : mhzTot < 100 ? "#ffd700" : "#ff6b35";
+                      return (
+                        <tr key={r.term.id}>
+                          <td style={{...tableTd, color:r.term.color, fontWeight:"bold"}}>● {r.term.label}</td>
+                          <td style={tableTd}>{r.sat ? "mPOWER-" + (r.sat.idx+1) : "—"}</td>
+                          <td style={tableTd}>{r.sat ? r.sat.el.toFixed(1) + "°" : "—"}</td>
+                          <td style={tableTd}>{r.gw ? r.gw.id : "—"}</td>
+                          <td style={tableTd}>{r.cn_baseline != null ? r.cn_baseline.toFixed(1) + " dB" : "—"}</td>
+                          <td style={{...tableTd, color: deltaColor, fontWeight:"bold"}}>{r.cni_db != null ? r.cni_db.toFixed(1) + " dB" : "—"}</td>
+                          <td style={{...tableTd, color: deltaColor}}>{delta != null ? (delta >= 0 ? "+" : "") + delta.toFixed(2) : "—"}</td>
+                          <td style={{...tableTd, color: r.modcod_intf ? r.modcod_intf.color : "#ff4444"}}>
+                            {r.modcod_intf ? r.modcod_intf.label : "LINK FAIL"}
+                          </td>
+                          <td style={{...tableTd, color: marginColor}}>{r.margin_db != null ? r.margin_db.toFixed(1) + " dB" : "—"}</td>
+                          <td style={tableTd}>{mhzFwd != null ? mhzFwd.toFixed(1) : "—"}</td>
+                          <td style={tableTd}>{mhzRtn != null ? mhzRtn.toFixed(1) : "—"}</td>
+                          <td style={{...tableTd, color: mhzColor, fontWeight:"bold"}}>{mhzTot != null ? mhzTot.toFixed(1) : "—"}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                  {satMhzTotals.size > 0 && (
+                    <tfoot>
+                      {[...satMhzTotals.entries()].map(([idx, t]) => {
+                        const utilPct = t.tot / SAT_PAYLOAD_MHZ * 100;
+                        const utilColor = utilPct < 30 ? "#00ff88" : utilPct < 70 ? "#ffd700" : "#ff6b35";
+                        return (
+                          <tr key={"sat-tot-" + idx} style={{background:"#0a1421"}}>
+                            <td style={{...tableTd, color:"#7090b0", fontStyle:"italic"}}>
+                              Σ on mPOWER-{idx+1} ({t.count} term)
+                            </td>
+                            <td style={tableTd} colSpan={8}/>
+                            <td style={{...tableTd, color:"#8ab0d0"}}>{t.fwd.toFixed(1)}</td>
+                            <td style={{...tableTd, color:"#8ab0d0"}}>{t.rtn.toFixed(1)}</td>
+                            <td style={{...tableTd, color: utilColor, fontWeight:"bold"}}>
+                              {t.tot.toFixed(1)} <span style={{fontSize:"11px", fontWeight:"normal"}}>({utilPct.toFixed(0)}% of {SAT_PAYLOAD_MHZ} MHz)</span>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tfoot>
+                  )}
+                </table>
+              );
+            })()}
+          </div>
+
+          <div style={panelStyle}>
+            <div style={secStyle}>PAIR-WISE INTERFERENCE DETAIL (same satellite, same colour)</div>
+            {(() => {
+              const allPairs = [];
+              for (const r of reports) {
+                for (const intf of (r.interferers || [])) {
+                  allPairs.push({ victim: r.term, attacker: intf, sat: r.sat });
+                }
+              }
+              if (allPairs.length === 0) {
+                return (
+                  <div style={{color:"#7090b0", fontSize:"13px", fontStyle:"italic", padding:"10px"}}>
+                    No interfering pairs. Either terminals are served by different satellites,
+                    using different frequency-reuse colours, or no terminals share a sat.
+                  </div>
+                );
+              }
+              return (
+                <table style={{width:"100%", borderCollapse:"collapse"}}>
+                  <thead>
+                    <tr style={{background:"#0d1a2a"}}>
+                      <th style={tableTh}>VICTIM</th>
+                      <th style={tableTh}>ATTACKER</th>
+                      <th style={tableTh}>SAT</th>
+                      <th style={tableTh}>θ AT SAT</th>
+                      <th style={tableTh}>θ / β-half</th>
+                      <th style={tableTh}>OFF-AXIS GAIN</th>
+                      <th style={tableTh}>C/I</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {allPairs.map((p, i) => {
+                      const norm = p.attacker.theta / interfBeamHalf;
+                      const ciColor = p.attacker.ci_db > 20 ? "#00ff88" : p.attacker.ci_db > 10 ? "#ffd700" : "#ff6b35";
+                      return (
+                        <tr key={i}>
+                          <td style={{...tableTd, color:p.victim.color}}>● {p.victim.label}</td>
+                          <td style={{...tableTd, color:p.attacker.color}}>● {p.attacker.label}</td>
+                          <td style={tableTd}>mPOWER-{p.sat.idx+1}</td>
+                          <td style={tableTd}>{p.attacker.theta.toFixed(2)}°</td>
+                          <td style={tableTd}>{norm.toFixed(2)}</td>
+                          <td style={tableTd}>{p.attacker.gOffDb.toFixed(1)} dB</td>
+                          <td style={{...tableTd, color: ciColor, fontWeight:"bold"}}>{p.attacker.ci_db.toFixed(1)} dB</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              );
+            })()}
+          </div>
+
+          <div style={{...panelStyle, background:"#0a1421"}}>
+            <div style={secStyle}>HOW TO READ THIS</div>
+            <div style={{color:"#8ab0d0", fontSize:"13px", lineHeight:1.6}}>
+              <div style={{marginBottom:"6px"}}>
+                <span style={{color:"#00cfff"}}>▸ Map</span> — each terminal projects its assigned satellite's
+                spot beam onto the ground as a colored ellipse. The ellipse stretches along the azimuth
+                toward the sub-satellite point and is more elongated at low elevations. Solid lines are
+                the terminal-to-sat link; dashed lines are sat-to-gateway.
+              </div>
+              <div style={{marginBottom:"6px"}}>
+                <span style={{color:"#ff4444"}}>▸ Red hatching</span> — the geographic region where two
+                co-channel terminals' beams overlap. This is the conceptual interference zone (a third
+                terminal placed inside the hatched area would see strong interference from both beams).
+              </div>
+              <div style={{marginBottom:"6px"}}>
+                <span style={{color:"#00cfff"}}>▸ Numbers update live</span> — drag the half-width slider
+                to see footprints shrink/expand and C/(N+I) move accordingly. Edit a terminal's lat/lon
+                to relocate it; the map and tables redraw on every change.
+              </div>
+              <div style={{marginBottom:"6px"}}>
+                <span style={{color:"#00cfff"}}>▸ MHz columns</span> — bandwidth needed per terminal,
+                computed as <span style={{fontFamily:"'Courier New', monospace"}}>Mbps / efficiency</span>.
+                Efficiency (bits/Hz) is from the empirical KA2517 + mPower grid, snap-to-nearest by
+                terminal latitude (grid is in 2.5° steps, ±40°). The Σ row totals MHz across all
+                terminals on the same satellite; utilisation % is vs an assumed 1 GHz Ka payload.
+                Above ~70% utilisation flags a satellite as resource-pressed even without interference.
+              </div>
+              <div>
+                <span style={{color:"#00cfff"}}>▸ Try it</span> — slide terminals close together (small
+                lon difference) and watch C/I collapse + red overlap appear. Then turn on 4-colour reuse
+                or narrow the beam — both should restore margin and shrink/eliminate the overlap.
+                Move terminals from equator to 40°N to see how much more MHz the same target rates
+                consume at low elevations. Push the FWD/RTN inputs higher (e.g. 32/8 Mbps) and watch
+                the satellite Σ row tip into orange utilisation.
+              </div>
+            </div>
+          </div>
+
+        </div>
+
+      </div>
+    </div>
+  );
+}
+
 
 function MapCanvas({ simTime, pins, onPinDrop, gpLat, gpLon, numSats, showGwLink, flightData, onAcBubble, pathMarkers, activeGateways, gwMinEl, flightSelecting, pendingOrigin, pendingDest, height }) {
   const canvasRef    = useRef(null);
@@ -4066,6 +5015,22 @@ export default function O3bSimulator() {
   const [realFlightSelected, setRealFlightSelected] = useState(null); // selected flight metadata
   const [realFlightTrack,   setRealFlightTrack]   = useState(null);   // {points:[{t,lat,lon,alt}], duration, info}
   const [strategyBeamHalf,  setStrategyBeamHalf]  = useState(3.0);    // half beam-width (deg) used by STRATEGY tab footprint-area calc
+
+  // ── INTERFERENCE TAB STATE ─────────────────────────────────────
+  // Up to 5 terminals manually placed on the map for static C/(N+I) analysis.
+  // Each terminal: {id, lat, lon, label, color}
+  const INTERFERENCE_COLORS = ["#00cfff", "#ff6b35", "#7fff00", "#ffd700", "#b07aff"];
+  const [interfTerminals, setInterfTerminals] = useState([
+    { id: 1, lat: 40.7128, lon:  -74.0060, label: "Terminal A", color: INTERFERENCE_COLORS[0] }, // NYC
+    { id: 2, lat: 40.7128, lon:  -73.0060, label: "Terminal B", color: INTERFERENCE_COLORS[1] }, // ~85 km east
+  ]);
+  const [interfBeamHalf,    setInterfBeamHalf]    = useState(0.8);  // satellite spot beam half-width (deg)
+  const [interfRolloffDb,   setInterfRolloffDb]   = useState(25);   // sidelobe rolloff at 1*beamHalf off-axis (dB)
+  const [interfReuseEnabled,setInterfReuseEnabled]= useState(true); // 4-color reuse (terminals only interfere if same color)
+  const [interfMbpsFwd,     setInterfMbpsFwd]     = useState(16); // user-configurable forward-link target rate (Mbps)
+  const [interfMbpsRtn,     setInterfMbpsRtn]     = useState(4);  // user-configurable return-link target rate (Mbps)
+  const [interfNextId,      setInterfNextId]      = useState(3);
+  const [interfPlacing,     setInterfPlacing]     = useState(false); // when true, next map click adds terminal
   const [realFlightLoading, setRealFlightLoading] = useState(false);
   const [realFlightError,   setRealFlightError]   = useState(null);
   const [aptQReal,          setAptQReal]          = useState("");
@@ -5775,6 +6740,7 @@ export default function O3bSimulator() {
           ["handover","⇄ HANDOVER"],
           ["elevation","∠ ELEVATION/TIME"],
           ["linkbudget","📡 LINK BUDGET"],
+          ["interference","▣ INTERFERENCE"],
         ].map(([id,lbl])=>(
           <div key={id} style={S.tab(tab===id)} onClick={()=>setTab(id)}>{lbl}</div>
         ))}
@@ -8033,6 +8999,34 @@ export default function O3bSimulator() {
             }) : null}
           />
         )}
+
+        {/* ════ TAB — Interference (Wave 1: static C/(N+I) analyzer) ════ */}
+        {tab==="interference" && (
+          <InterferenceTab
+            simTime={simTime}
+            numSats={numSats}
+            satNames={satNames}
+            activeGateways={activeGateways}
+            gwMinEl={gwMinEl}
+            ka2517MinEl={ka2517MinEl}
+            interfTerminals={interfTerminals}
+            setInterfTerminals={setInterfTerminals}
+            interfBeamHalf={interfBeamHalf}
+            setInterfBeamHalf={setInterfBeamHalf}
+            interfRolloffDb={interfRolloffDb}
+            setInterfRolloffDb={setInterfRolloffDb}
+            interfReuseEnabled={interfReuseEnabled}
+            setInterfReuseEnabled={setInterfReuseEnabled}
+            interfMbpsFwd={interfMbpsFwd}
+            setInterfMbpsFwd={setInterfMbpsFwd}
+            interfMbpsRtn={interfMbpsRtn}
+            setInterfMbpsRtn={setInterfMbpsRtn}
+            interfNextId={interfNextId}
+            setInterfNextId={setInterfNextId}
+            INTERFERENCE_COLORS={INTERFERENCE_COLORS}
+          />
+        )}
+
 
       </div>
     </div>
