@@ -6,9 +6,44 @@ import {
 } from "recharts";
 
 // ═══════════════════════════════════════════════════════════════
+// REACT HOOK HELPERS
+// ═══════════════════════════════════════════════════════════════
+/**
+ * useLatestRef — returns a ref that always reflects the latest value of `value`.
+ * Used to bridge prop/state values into long-lived callbacks (draw loops, event
+ * handlers) without re-creating the callback on every render. v4.21.4 (review M5/L8):
+ * replaces the repeated `const r = useRef(v); useEffect(() => { r.current = v; }, [v])` pattern.
+ * @template T
+ * @param {T} value
+ * @returns {{ current: T }}
+ */
+function useLatestRef(value) {
+  const ref = useRef(value);
+  useEffect(() => { ref.current = value; }, [value]);
+  return ref;
+}
+
+// ═══════════════════════════════════════════════════════════════
 // ORBITAL CONSTANTS — O3b mPOWER
 // ═══════════════════════════════════════════════════════════════
-const VERSION = "v4.21.3";
+// v4.21.4 — review fixes from Claudina (25 May 2026):
+//   C1: Ka2517 efficiency grid symmetry (asymmetric Southern Hemisphere rows)
+//   H1: Tier-coverage comments updated to reflect actual code
+//   H2: runStrategyComparison cancellation guard
+//   H3: flightSelectingRef declared before use
+//   M1: flightData→gp position precision coarsened (toFixed 3→2)
+//   M2: simTime removed from flightStats dep array
+//   M3: interfActiveLinks memoized
+//   M4: getSatNames hoisted out of resourceData hot loop
+//   M5/L8: useLatestRef helper introduced; consolidated 11 ref-syncing useEffects in MapCanvas
+//   L1: Removed duplicate VOMM key in DEST_AIRPORT_NAMES
+//   L2: Atmospheric / rain / misc loss factored into named constants
+//   L3: C_LIGHT = 299792458 (was 3e8)
+//   L4: losGroundPoints uses module Re instead of inline 6371
+//   L5: CRUISE_ALT_KM intent documented (lower-bound, not typical cruise)
+//   L6: Removed dead 5-char ZSAAK key from AIRLINE_NAMES
+//   L7: Documented the 41.25° lat cutoff in ka2517EfficiencyLookup
+const VERSION = "v4.21.4";
 const Re     = 6371;
 const h_orb  = 8063;
 const Rs     = Re + h_orb;
@@ -544,7 +579,7 @@ const AIRLINE_NAMES = {
   SYR:"Syrianair",TAM:"LATAM Brasil",TAP:"TAP Portugal",THA:"Thai Airways",THY:"Turkish",
   TRA:"Transavia",TVF:"Transavia France",UAE:"Emirates",UAL:"United",UBT:"Tui Belgium",
   UCA:"Commutair",UPS:"UPS",VIR:"Virgin Atlantic",VOI:"Volaris",VRD:"Virgin America",
-  VLG:"Vueling",WJA:"WestJet",WUP:"Western Global",XAX:"AirAsia X",ZSAAK:"South African",
+  VLG:"Vueling",WJA:"WestJet",WUP:"Western Global",XAX:"AirAsia X", // v4.21.4 (review L6): removed dead ZSAAK key (5-char, never matches 3-char prefix)
 };
 
 // Friendly name for any airport ICAO code (just for displaying in result list).
@@ -624,7 +659,7 @@ const DEST_AIRPORT_NAMES = {
   // Asia
   VIDP:"Delhi",VABB:"Mumbai",VOMM:"Chennai",VOBL:"Bangalore",VOHS:"Hyderabad",
   VOCI:"Kochi",VOCB:"Coimbatore",VOTV:"Trivandrum",VECC:"Kolkata",VAAH:"Ahmedabad",
-  VOGO:"Goa",VOMM:"Madras",VOTR:"Tiruchirappalli",VEBN:"Varanasi",VEPT:"Patna",
+  VOGO:"Goa",VOTR:"Tiruchirappalli",VEBN:"Varanasi",VEPT:"Patna", // v4.21.4 (review L1): removed duplicate VOMM ("Madras" — same as Chennai above)
   VAJJ:"Pune",VANP:"Nagpur",
   VHHH:"Hong Kong",VMMC:"Macau",ZBAA:"Beijing Capital",ZBAD:"Beijing Daxing",ZSPD:"Shanghai Pudong",
   ZSSS:"Shanghai Hongqiao",ZGGG:"Guangzhou",ZGSZ:"Shenzhen",ZUUU:"Chengdu",ZSHC:"Hangzhou",
@@ -768,10 +803,10 @@ function losGroundPoints(gwLat, gwLon, satLon, elDeg, n=20) {
   const az   = azimToSubSat(gwLat, gwLon, satLon);
   const elR  = toRad(Math.max(elDeg, 5));
   const maxKm = Math.min(12 / Math.tan(elR), 50); // troposphere crossing distance
-  const R = 6371;
+  // v4.21.4 (review L4): use module-level Re instead of redeclaring a local R.
   return Array.from({length:n}, (_,i) => {
     const d  = (i/(n-1)) * maxKm;
-    const dr = d / R;
+    const dr = d / Re;
     const la1 = toRad(gwLat), az1 = toRad(az);
     const lat2 = Math.asin(Math.sin(la1)*Math.cos(dr) + Math.cos(la1)*Math.sin(dr)*Math.cos(az1));
     const lon2 = toRad(gwLon) + Math.atan2(Math.sin(az1)*Math.sin(dr)*Math.cos(la1),
@@ -2658,16 +2693,22 @@ function GatewayWeatherTab({ simTime, numSats, satNames }) {
 }
 // ═══════════════════════════════════════════════════════════════
 const F_DL     = 19.95e9;
-const C_LIGHT  = 3e8;
+const C_LIGHT  = 299792458; // v4.21.4 (review L3): was 3e8 (introduced ~0.07% FSPL error)
 const EIRP_DBW = 68;
 const GT_DB    = 14.5;
 const BW_MHZ   = 216;
 const K_DB     = -228.6;
+// v4.21.4 (review L2): atmospheric / margin loss breakdown used by both legacy
+// linkBudget and aviation linkBudgetFL/RL. Kept as named constants so the two
+// budgets stay aligned (previously legacy used 0.5 dB atm vs aviation 0.3 dB).
+const ATM_LOSS_LEGACY_DB = 0.5; // legacy (fixed terminal) atmospheric loss
+const RAIN_LOSS_DB       = 2.5; // clear-sky rain allowance
+const MISC_LOSS_DB       = 1.0; // implementation / pointing / other
 
 function linkBudget(elDeg) {
   const d_m  = slantRange(elDeg) * 1000;
   const FSPL = 20 * Math.log10(4 * Math.PI * d_m * F_DL / C_LIGHT);
-  const loss = FSPL + 0.5 + 2.5 + 1.0;
+  const loss = FSPL + ATM_LOSS_LEGACY_DB + RAIN_LOSS_DB + MISC_LOSS_DB; // v4.21.4 (review L2)
   const C_No = EIRP_DBW - loss + GT_DB - K_DB;
   const C_N  = C_No - 10 * Math.log10(BW_MHZ * 1e6);
   const cap  = BW_MHZ * Math.log2(1 + Math.pow(10, C_N / 10));
@@ -2684,7 +2725,13 @@ function linkBudget(elDeg) {
 // ═══════════════════════════════════════════════════════════════
 // MODULE B — ThinKom Ka2517 ANTENNA MODEL
 // ═══════════════════════════════════════════════════════════════
-const CRUISE_ALT_KM  = 3.048;   // 10,000 ft fixed
+// v4.21.4 (review L5): renamed from CRUISE_ALT_KM. 3.048 km = 10,000 ft is a
+// conservative LOWER-BOUND aircraft altitude used for slantRangeAviation. Real
+// commercial Ka-band cruise is FL350–FL410 (~10.7–12.5 km), but at MEO range
+// the slant-range difference is <0.05% FSPL (negligible), so we hold the floor.
+// If you ever need true cruise altitude, swap this in slantRangeAviation only.
+const AIRCRAFT_ALT_FLOOR_KM = 3.048;
+const CRUISE_ALT_KM = AIRCRAFT_ALT_FLOOR_KM; // back-compat alias for existing references
 const ATM_LOSS_FL_DB = 0.3;     // Clear-sky FL atmospheric loss
 const ATM_LOSS_RL_DB = 0.3;     // Clear-sky RL atmospheric loss
 const MIN_SERVICE_EL_DEFAULT = 20.0; // Ka2517 minimum elevation default (user-configurable)
@@ -2768,7 +2815,7 @@ function linkBudgetFL(elDeg, useKa2517=false) {
   const d_m = (useKa2517 ? slantRangeAviation(elDeg) : slantRange(elDeg)) * 1000;
   const FSPL = 20 * Math.log10(4 * Math.PI * d_m * F_DL / C_LIGHT);
   const gt = useKa2517 ? ka2517GT(elDeg) : GT_DB;
-  const loss = FSPL + ATM_LOSS_FL_DB + 2.5 + 1.0; // atm + rain(0) + misc
+  const loss = FSPL + ATM_LOSS_FL_DB + RAIN_LOSS_DB + MISC_LOSS_DB; // v4.21.4 (review L2): named constants
   const C_No = EIRP_DBW - loss + gt - K_DB;
   const C_N  = C_No - 10 * Math.log10(BW_MHZ * 1e6);
   const modcod = dvbS2xModcod(C_N);
@@ -2779,7 +2826,7 @@ function linkBudgetRL(elDeg, useKa2517=false, satGtDbk=12.0) {
   const d_m = (useKa2517 ? slantRangeAviation(elDeg) : slantRange(elDeg)) * 1000;
   const FSPL = 20 * Math.log10(4 * Math.PI * d_m * F_UL / C_LIGHT);
   const eirp = useKa2517 ? ka2517TxEirp(elDeg) : 55.5;
-  const loss = FSPL + ATM_LOSS_RL_DB + 1.0;
+  const loss = FSPL + ATM_LOSS_RL_DB + MISC_LOSS_DB; // v4.21.4 (review L2): named constants (RL has no rain term — uplink is uncontested)
   const C_No = eirp - loss + satGtDbk - K_DB;
   const C_N  = C_No - 10 * Math.log10(BW_MHZ * 1e6);
   const modcod = dvbS2xModcod(C_N);
@@ -2818,8 +2865,8 @@ const KA2517_EFFICIENCY_GRID = [
   { lat:  0.0, elEdge: 40.3, elCenter: 90.0, effEdgeFwd:1.250, effEdgeRtn:1.540, effCenterFwd:1.500, effCenterRtn:2.000 },
   { lat: -2.5, elEdge: 39.4, elCenter: 85.7, effEdgeFwd:1.209, effEdgeRtn:1.524, effCenterFwd:1.444, effCenterRtn:1.991 },
   { lat: -5.0, elEdge: 38.4, elCenter: 81.4, effEdgeFwd:1.167, effEdgeRtn:1.508, effCenterFwd:1.387, effCenterRtn:1.982 },
-  { lat: -7.5, elEdge: 37.5, elCenter: 77.1, effEdgeFwd:1.167, effEdgeRtn:1.491, effCenterFwd:1.331, effCenterRtn:1.974 },
-  { lat:-10.0, elEdge: 36.5, elCenter: 72.8, effEdgeFwd:1.167, effEdgeRtn:1.475, effCenterFwd:1.275, effCenterRtn:1.965 },
+  { lat: -7.5, elEdge: 37.5, elCenter: 77.1, effEdgeFwd:1.126, effEdgeRtn:1.491, effCenterFwd:1.331, effCenterRtn:1.974 }, // v4.21.4: was 1.167 (asymmetry bug, see review C1)
+  { lat:-10.0, elEdge: 36.5, elCenter: 72.8, effEdgeFwd:1.085, effEdgeRtn:1.475, effCenterFwd:1.275, effCenterRtn:1.965 }, // v4.21.4: was 1.167 (asymmetry bug, see review C1)
   { lat:-12.5, elEdge: 35.5, elCenter: 68.6, effEdgeFwd:1.085, effEdgeRtn:1.459, effCenterFwd:1.234, effCenterRtn:1.924 },
   { lat:-15.0, elEdge: 34.6, elCenter: 64.3, effEdgeFwd:1.002, effEdgeRtn:1.442, effCenterFwd:1.192, effCenterRtn:1.883 },
   { lat:-17.5, elEdge: 33.6, elCenter: 60.0, effEdgeFwd:0.961, effEdgeRtn:1.426, effCenterFwd:1.151, effCenterRtn:1.841 },
@@ -2836,6 +2883,8 @@ const KA2517_EFFICIENCY_GRID = [
 
 // Snap to nearest lat row; returns the entry or null if outside grid range.
 function ka2517EfficiencyLookup(latDeg) {
+  // v4.21.4 (review L7): 41.25 = grid endpoint (±40°) + half a grid step (1.25°).
+  // Ensures lat=40.0 snaps to the boundary row instead of returning null.
   if (Math.abs(latDeg) > 41.25) return null;
   let best = null, bestDist = Infinity;
   for (const r of KA2517_EFFICIENCY_GRID) {
@@ -3271,6 +3320,12 @@ function InterferenceTab({
   const [stratMinEl, setStratMinEl] = useState(5); // service threshold for strategy comparison; lower than ka2517MinEl by design
   const [stratResults, setStratResults] = useState(null);
   const [stratRunning, setStratRunning] = useState(false);
+  // v4.21.4 (review H2): track the deferred setTimeout so a rapid second click
+  // (or an unmount) cancels the in-flight run before its setState writes land.
+  const stratTimeoutRef = useRef(null);
+  useEffect(() => () => {
+    if (stratTimeoutRef.current) clearTimeout(stratTimeoutRef.current);
+  }, []);
 
   // ── Strategy playback state ──
   // After RUN, three small canvas maps below the cards play through the simulation.
@@ -3310,7 +3365,9 @@ function InterferenceTab({
   }, []);
 
   // ─── 1. Compute per-terminal active link (best sat + best GW) ──
-  const interfActiveLinks = interfTerminals.map(term => {
+  // v4.21.4 (review M3): memoized — was a plain .map() that re-ran on every
+  // simTime tick (i.e. ~30/sec during playback) regardless of whether inputs changed.
+  const interfActiveLinks = useMemo(() => interfTerminals.map(term => {
     let bestSat = null, bestSatEl = -90;
     for (let i = 0; i < numSats; i++) {
       const sLon = satLon(i, simTime, numSats);
@@ -3326,7 +3383,7 @@ function InterferenceTab({
     }
     const viable = bestSat && bestSat.el >= ka2517MinEl && bestGw;
     return { term, sat: bestSat, gw: bestGw, viable };
-  });
+  }), [interfTerminals, simTime, numSats, activeGateways, gwMinEl, ka2517MinEl]);
 
   // ─── 2. Helper: angular sep at satellite between two terminals ──
   const angSepAtSat = (satLonDeg, ptA, ptB) => {
@@ -3448,9 +3505,12 @@ function InterferenceTab({
   //
   // Returns null until user presses "RUN COMPARISON".
   const runStrategyComparison = useCallback(() => {
+    // v4.21.4 (review H2): cancel any previously-scheduled run before starting a new one.
+    if (stratTimeoutRef.current) clearTimeout(stratTimeoutRef.current);
     setStratRunning(true);
     // Defer to next tick so the UI shows a "running" state
-    setTimeout(() => {
+    stratTimeoutRef.current = setTimeout(() => {
+      stratTimeoutRef.current = null;
       const STEP_SEC = 60;                          // 1-minute resolution
       const N_STEPS  = Math.max(2, Math.floor(stratWindowMin));
       const SAT_HYS  = 2;                           // deg, matches existing convention
@@ -5224,9 +5284,6 @@ function MapCanvas({ simTime, pins, onPinDrop, gpLat, gpLon, numSats, showGwLink
   const wrapRef      = useRef(null);
   const worldRef     = useRef(null);
   const transformRef = useRef(d3.zoomIdentity);
-  const simTimeRef   = useRef(simTime);
-  const pinsRef      = useRef(pins);
-  const gpRef        = useRef({ lat: gpLat, lon: gpLon });
   const dragStart    = useRef(null);
   const zoomBehav    = useRef(null);
   const projRef      = useRef(null);   // stores current projection for hit-testing
@@ -5238,28 +5295,23 @@ function MapCanvas({ simTime, pins, onPinDrop, gpLat, gpLon, numSats, showGwLink
   const [pinMode, setPinMode] = useState(false);
   const [dotTip,  setDotTip]  = useState(null);  // hovered flight-path dot tooltip
   const pinModeRef = useRef(false);
-  const numSatsRef = useRef(numSats);
-  const showGwLinkRef = useRef(showGwLink);
-  const flightDataRef   = useRef(flightData);
-  const pathMarkersRef  = useRef(pathMarkers);
-  const activeGatewaysRef = useRef(activeGateways);
-  const prevSatIdxRef       = useRef(-1);  // hysteresis: last active satellite index
-  const gwMinElRef           = useRef(gwMinEl);  // keep draw callback in sync with prop
-  const flightSelectingRef_  = useRef(flightSelecting); // keep click handler in sync with prop
-  const pendingOriginRef     = useRef(pendingOrigin);
-  const pendingDestRef       = useRef(pendingDest);
+  const prevSatIdxRef = useRef(-1);  // hysteresis: last active satellite index
 
-  // Keep refs in sync so draw callback always has latest values
-  useEffect(() => { simTimeRef.current = simTime; }, [simTime]);
-  useEffect(() => { pinsRef.current = pins; }, [pins]);
-  useEffect(() => { gpRef.current = { lat: gpLat, lon: gpLon }; }, [gpLat, gpLon]);
-  useEffect(() => { numSatsRef.current = numSats; }, [numSats]);
-  useEffect(() => { showGwLinkRef.current = showGwLink; }, [showGwLink]);
-  useEffect(() => { flightDataRef.current    = flightData;     }, [flightData]);
-  useEffect(() => { pathMarkersRef.current   = pathMarkers;    }, [pathMarkers]);
-  useEffect(() => { activeGatewaysRef.current = activeGateways; }, [activeGateways]);
-  useEffect(() => { gwMinElRef.current = gwMinEl; }, [gwMinEl]);
-  useEffect(() => { flightSelectingRef_.current = flightSelecting; }, [flightSelecting]);
+  // v4.21.4 (review M5/L8): consolidated 11 ref-syncing useEffects into useLatestRef calls.
+  // Each ref always reflects the latest prop value; consumers (draw, handlers) read .current.
+  const simTimeRef        = useLatestRef(simTime);
+  const pinsRef           = useLatestRef(pins);
+  const gpRef             = useLatestRef({ lat: gpLat, lon: gpLon });
+  const numSatsRef        = useLatestRef(numSats);
+  const showGwLinkRef     = useLatestRef(showGwLink);
+  const flightDataRef     = useLatestRef(flightData);
+  const pathMarkersRef    = useLatestRef(pathMarkers);
+  const activeGatewaysRef = useLatestRef(activeGateways);
+  const gwMinElRef        = useLatestRef(gwMinEl);
+  const flightSelectingRef_ = useLatestRef(flightSelecting);
+  // The pendingOrigin/pendingDest refs also need to trigger a redraw — keep them explicit.
+  const pendingOriginRef  = useRef(pendingOrigin);
+  const pendingDestRef    = useRef(pendingDest);
   useEffect(() => { pendingOriginRef.current = pendingOrigin; if (ready) draw(); }, [pendingOrigin, ready]);
   useEffect(() => { pendingDestRef.current   = pendingDest;   if (ready) draw(); }, [pendingDest,   ready]);
 
@@ -6143,6 +6195,11 @@ export default function O3bSimulator() {
   const [recentAirports,    setRecentAirports]    = useState(() => lsGet(LS_RECENT_AIRPORTS, [])); // (E) persisted
   const [recentFlights,     setRecentFlights]     = useState(() => lsGet(LS_RECENT_FLIGHTS, []));
   const [flightSelecting, setFlightSelecting_] = useState(null); // "origin" | "dest" | null
+  // v4.21.4 (review H3): ref declared *before* the wrapper that uses it.
+  // Previously this lived ~20 lines below; the working code only worked
+  // because function declarations are hoisted within their scope and the
+  // ref was initialized by the time the wrapper was actually called.
+  const flightSelectingRef = useRef(null);
   // Wrapper keeps the ref in sync for the onPinDrop closure
   function setFlightSelecting(v) { flightSelectingRef.current = v; setFlightSelecting_(v); }
   const [aptQ1, setAptQ1] = useState("");  // airport search query — origin
@@ -6162,7 +6219,7 @@ export default function O3bSimulator() {
   const satNames = useMemo(() => getSatNames(numSats), [numSats]);
   const satSpacing = (360 / numSats).toFixed(1);
 
-  const flightSelectingRef = useRef(null); // ref mirror of flightSelecting for onPinDrop closure
+  // v4.21.4 (review H3): flightSelectingRef now declared above with setFlightSelecting.
   const onPinDrop = useCallback(({ lat, lon }) => {
     const sel = flightSelectingRef.current;
     const label = `${Math.abs(lat).toFixed(2)}${lat>=0?"N":"S"} ${Math.abs(lon).toFixed(2)}${lon>=0?"E":"W"}`;
@@ -6508,11 +6565,14 @@ export default function O3bSimulator() {
     };
   }, [flightMode, flightOrigin, flightDest, flightStartTime, simTime, realFlightTrack]);
 
-  // When flight is active, update analysis point to track the plane
+  // When flight is active, update analysis point to track the plane.
+  // v4.21.4 (review M1): coarsen to 2 decimals (~1 km). React's setState bails
+  // out when the new primitive === current, so a slow-moving aircraft no longer
+  // triggers downstream re-renders on every 33 ms animation tick.
   useEffect(() => {
     if (flightData && !flightData.complete) {
-      setGpLat(+flightData.pos.lat.toFixed(3));
-      setGpLon(+flightData.pos.lon.toFixed(3));
+      setGpLat(+flightData.pos.lat.toFixed(2));
+      setGpLon(+flightData.pos.lon.toFixed(2));
     }
   }, [flightData]);
 
@@ -6526,24 +6586,25 @@ export default function O3bSimulator() {
     const SAT_HYS = 2, GW_HYS = 3;
     let prevSatIdx = -1, prevGwId = null;
 
-    // Three coverage tiers — each independently tracked:
-    //  1. Constellation  — any satellite EL > 5° (pure orbital geometry)
-    //  2. Ka2517 terminal — best sat EL ≥ 15° (within scan floor, regardless of GW)
-    //  3. End-to-end service — EL ≥ 15° AND an active gateway sees the satellite
+    // Three coverage tiers — each independently tracked. Thresholds are
+    // user-configurable; default values noted in parentheses for orientation.
+    //  1. Constellation       — best satellite EL ≥ gwMinEl     (default 10°; operational floor for any link)
+    //  2. Ka2517 terminal     — best satellite EL ≥ ka2517MinEl (default 20°; antenna scan floor, regardless of GW)
+    //  3. End-to-end service  — Tier-2 viable AND an active gateway sees the same satellite at ≥ gwMinEl
     let covCount = 0, terminalCovCount = 0, e2eCovCount = 0;
     // Alternative satellite tracking: during "no active gateway" closures,
     // track terminal EL of the sat that HAS gw coverage (below ka2517MinEl)
     let altTermElMin = 999, altTermElMax = -999, altTermElSum = 0, altTermElCount = 0;
-    // Elevation stats collected only over terminal-viable samples (EL ≥ 15°)
+    // Elevation stats collected only over Tier-2 (terminal-viable) samples.
     let sumEl = 0, minEl = 999, maxEl = -999;
     let satHandovers = 0, gwHandovers = 0;
     const satDuration = {}, gwDuration = {};
     const gwElStats = {}; // gwId -> { sumEl, minEl, maxEl, count }
     const satTransitions = [];
     const gwTransitions  = [];
-    const coverageGaps   = []; // constellation outages  (EL < 5°)
-    const terminalGaps   = []; // terminal outages       (EL < 15°, but sat may be visible)
-    const serviceGaps    = []; // e2e service outages    (EL ≥ 15° but no active gateway)
+    const coverageGaps   = []; // Tier-1 outages: best EL < gwMinEl
+    const terminalGaps   = []; // Tier-2 outages: best EL < ka2517MinEl (sat may still be Tier-1 visible)
+    const serviceGaps    = []; // Tier-3 outages: Tier-2 ok but no active GW sees the serving sat
     let gapStart = null, terminalGapStart = null, serviceGapStart = null;
 
     for (let i = 0; i <= N; i++) {
@@ -6729,12 +6790,12 @@ export default function O3bSimulator() {
     return {
       origin: flightOrigin, dest: flightDest,
       dist, durationSec, durationHours, speedKmh: FLIGHT_SPEED_KMH,
-      // Three-tier coverage
-      covPct,          // Tier 1: constellation (any sat EL > 5°)
-      terminalCovPct,  // Tier 2: Ka2517 terminal viable (EL ≥ 15°)
-      e2eCovPct,       // Tier 3: end-to-end with active gateway
+      // Three-tier coverage (thresholds are user-configurable; defaults in parens)
+      covPct,          // Tier 1: constellation (best sat EL ≥ gwMinEl, default 10°)
+      terminalCovPct,  // Tier 2: Ka2517 terminal viable (best sat EL ≥ ka2517MinEl, default 20°)
+      e2eCovPct,       // Tier 3: end-to-end (Tier-2 viable AND an active GW sees same sat)
       serviceCovPct: e2eCovPct, // alias used elsewhere in JSX
-      // Elevation stats (over terminal-viable samples)
+      // Elevation stats (over Tier-2 / terminal-viable samples)
       minEl: terminalCovCount > 0 ? +minEl.toFixed(1) : 0,
       maxEl: terminalCovCount > 0 ? +maxEl.toFixed(1) : 0,
       avgEl: terminalCovCount > 0 ? +(sumEl / terminalCovCount).toFixed(1) : 0,
@@ -6752,7 +6813,11 @@ export default function O3bSimulator() {
       numSats,
       activeGwCount: activeGateways.length,
     };
-  }, [tab, flightMode, flightOrigin, flightDest, flightStartTime, simTime, numSats, activeGateways, gwMinEl, ka2517MinEl, realFlightTrack]);
+    // v4.21.4 (review M2): simTime intentionally OMITTED from deps. The sweep
+    // covers the whole flight from flightStartTime → flightStartTime+durationSec
+    // and doesn't depend on the current playback cursor. Including simTime made
+    // this 400-iteration sweep re-run ~30×/sec while playback was active.
+  }, [tab, flightMode, flightOrigin, flightDest, flightStartTime, numSats, activeGateways, gwMinEl, ka2517MinEl, realFlightTrack]);
 
   // Resource chart data — precomputed 400-sample sweep for Tab 6 chart + pairing table
   const resourceData = useMemo(() => {
@@ -6767,6 +6832,8 @@ export default function O3bSimulator() {
     const satHandoffs = [], gwHandoffs = [];
     let worstFwd = 0, worstRtn = 0, worstFwdPair = "", worstRtnPair = "";
     let covCount = 0;
+    // v4.21.4 (review M4): hoist sat-name list out of the 400-iteration loop.
+    const satNamesLocal = getSatNames(numSats);
 
     for (let i = 0; i <= N; i++) {
       const f = i / N;
@@ -6821,7 +6888,7 @@ export default function O3bSimulator() {
 
       // Accumulate pairing
       if (activeGwId && activeSat >= 0) {
-        const satName = getSatNames(numSats)[activeSat];
+        const satName = satNamesLocal[activeSat]; // v4.21.4 (review M4)
         const key = `${satName}|${activeGwId}`;
         const gwObj = activeGateways.find(g => g.id === activeGwId);
         if (!pairings.has(key)) {
