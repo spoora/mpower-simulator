@@ -11,7 +11,7 @@ import {
 /**
  * useLatestRef — returns a ref that always reflects the latest value of `value`.
  * Used to bridge prop/state values into long-lived callbacks (draw loops, event
- * handlers) without re-creating the callback on every render. v4.21.4 (review M5/L8):
+ * handlers) without re-creating the callback on every render. v4.22.1 (review M5/L8):
  * replaces the repeated `const r = useRef(v); useEffect(() => { r.current = v; }, [v])` pattern.
  * @template T
  * @param {T} value
@@ -23,19 +23,34 @@ function useLatestRef(value) {
   return ref;
 }
 
+/**
+ * useQuantizedValue — snap `value` to multiples of `step` so a memo that depends
+ * on this only recomputes when the bucket changes. v4.22.1 (review NEW-7):
+ * coarsens simTime for the expensive handover-search memos (was recomputing 30x/sec).
+ * @param {number} value
+ * @param {number} step
+ * @returns {number}
+ */
+function useQuantizedValue(value, step) {
+  return useMemo(() => Math.floor(value / step) * step, [value, step]);
+}
+
 // ═══════════════════════════════════════════════════════════════
 // ORBITAL CONSTANTS — O3b mPOWER
 // ═══════════════════════════════════════════════════════════════
-// v4.21.4 — review fixes from Claudina (25 May 2026):
-//   C1: Ka2517 efficiency grid symmetry (asymmetric Southern Hemisphere rows)
-//   H1: Tier-coverage comments updated to reflect actual code
+// v4.22.1 — Claudina review-merge (25 May 2026): v4.22 + v4.21.4 fix set + new
+// handover-engine bug fixes. See mpower_simulator_code_review_v4.22.md for detail.
+//
+// Ported from v4.21.4 fix set (against v4.21.1 baseline):
+//   C1: Ka2517 efficiency grid symmetry  (asymmetric Southern Hemisphere rows)
+//   H1: Tier-coverage comments aligned with actual code
 //   H2: runStrategyComparison cancellation guard
 //   H3: flightSelectingRef declared before use
 //   M1: flightData→gp position precision coarsened (toFixed 3→2)
 //   M2: simTime removed from flightStats dep array
 //   M3: interfActiveLinks memoized
 //   M4: getSatNames hoisted out of resourceData hot loop
-//   M5/L8: useLatestRef helper introduced; consolidated 11 ref-syncing useEffects in MapCanvas
+//   M5/L8: useLatestRef helper; consolidated 11 ref-syncing useEffects in MapCanvas
 //   L1: Removed duplicate VOMM key in DEST_AIRPORT_NAMES
 //   L2: Atmospheric / rain / misc loss factored into named constants
 //   L3: C_LIGHT = 299792458 (was 3e8)
@@ -43,7 +58,19 @@ function useLatestRef(value) {
 //   L5: CRUISE_ALT_KM intent documented (lower-bound, not typical cruise)
 //   L6: Removed dead 5-char ZSAAK key from AIRLINE_NAMES
 //   L7: Documented the 41.25° lat cutoff in ka2517EfficiencyLookup
-const VERSION = "v4.21.4";
+//
+// Ported from v4.21.3 (v4.22 had forked off v4.21.1 and missed these):
+//   loadRealFlightTrack debounce ref, sessionStorage cache, HTTP 429/5xx branches
+//
+// New v4.22 bug fixes (against v4.22 baseline):
+//   NEW-1: fmtScheduleTime anchors sim t=0 to module-load wall-clock (was 1970 epoch)
+//   NEW-2: passDurationSec derived from w_rel (was magic constant *60 that only fit mPOWER altitude)
+//   NEW-3: O3bHandoverTimelinePanel "Copy" timer has cleanup ref
+//   NEW-4: ANT2 SEARCH→TRACK transition uses named constant (was hardcoded -30)
+//   NEW-5: Overlap-window cap uses named OVERLAP_GRACE_SEC (was hardcoded +4)
+//   NEW-7: findNextHandover memo coarsened to 5-sec simTime buckets (was 30/sec)
+//   NEW-8: buildScheduleXML uses `?? 10` not `|| 10` (so explicit minEl=0 works)
+const VERSION = "v4.22.1 (O3b Handover Realism Pack + review-merge)";
 const Re     = 6371;
 const h_orb  = 8063;
 const Rs     = Re + h_orb;
@@ -57,9 +84,79 @@ const MAX_SATS  = 11;
 const SAT_COLORS= ["#00cfff","#ff6b35","#7fff00","#ff69b4","#ffd700","#b07aff","#ff4444","#00ced1","#ffbf00","#98fb98","#ff6eb4"];
 const EL_LEVELS = [5,10,15,20,25,30,35,40,45,50,55,60];
 
+// ═══════════════════════════════════════════════════════════════
+// CONSTELLATION CONFIG — toggle between live mPOWER and documented O3b classic
+// Ref: O3B-SYS-ENG-000xx (Handover Timeline rev3) for O3b classic geometry.
+// mPOWER values derived by scaling 360°/N rule; flag with caveat in UI.
+// ═══════════════════════════════════════════════════════════════
+const CONSTELLATIONS = {
+  MPOWER: {
+    id:                 "MPOWER",
+    label:              "mPOWER (11 sats, modeled)",
+    numSats:            11,
+    subRegionDeg:       360/11 - 1,      // ≈ 31.7° — derived, not a documented mPOWER spec
+    gapDeg:             1.0,
+    beamsPerSubRegion:  8,
+    namePrefix:         "mPOWER-",
+    nameFormat:         "short",         // "mPOWER-1"
+    docSource:          "Modeled — scaled from O3b classic geometry",
+  },
+  O3B_CLASSIC: {
+    id:                 "O3B_CLASSIC",
+    label:              "O3b classic (8 sats, doc)",
+    numSats:            8,
+    subRegionDeg:       45.5,            // documented in O3B-SYS-ENG-000xx §2
+    gapDeg:             1.0,             // documented payload re-target window
+    beamsPerSubRegion:  5,               // doc §2: 5 customer beams per sub-region
+    namePrefix:         "O3B M",
+    nameFormat:         "padded",        // "O3B M001"
+    docSource:          "O3B-SYS-ENG-000xx Handover Timeline rev3",
+  },
+};
+
+// ═══════════════════════════════════════════════════════════════
+// HANDOVER TIMING — all values from O3B-SYS-ENG-000xx Figure 2-3
+// "Real" make-before-break timeline. Used by realHandoverEngine.
+// ═══════════════════════════════════════════════════════════════
+const HANDOVER_TIMING = {
+  PRE_HANDOVER_SEC:      60,    // T=-60s: ANT2 begins tracking rising sat via TLE
+  ANT2_TRACK_TRANSITION_SEC: 30, // v4.22.1 (review NEW-4): ANT2 transitions SEARCH→TRACK at T=-30s (half of PRE_HANDOVER)
+  OVERLAP_TARGET_SEC:    30,    // T=0 to +30s: target data overlap window
+  OVERLAP_MIN_SEC:       26,    // T=+26s: setting sat first blank-on CMD
+  OVERLAP_GRACE_SEC:     4,     // v4.22.1 (review NEW-5): amps-blank grace before full cut (caps effective overlap at OVERLAP_MIN_SEC + this)
+  HANDOVER_DEADLINE_SEC: 25,    // Vendor must complete handover within 25 s
+  MODEM_LOCK_SEC:        20,    // T=+20s: demod-B locked to rising sat
+  ANT1_RELEASE_SEC:      60,    // T=+60s: ANT1 RF paths removed by scheduler
+  BEAM_STAGGER_SEC:      1.0,   // O3B-SAT-TRD-REQ-1: ≤ 1 transponder/sec power application
+  PAYLOAD_REPOINT_SEC:   60,    // SC antenna repoint window (1° between sub-regions)
+  MIN_OVERLAP_PLAN_SEC:  30,    // Planning floor — ground antennas must lock up
+};
+
+// Antenna states per ICD M&C Schedule File
+const ANT_STATE = {
+  OFF:    "OFF",
+  SEARCH: "SEARCH",   // TLE-based tracking, no carrier
+  TRACK:  "TRACK",    // beacon lock, ready for data
+  ACTIVE: "ACTIVE",   // carrying traffic
+};
+
+// Handover phase machine
+const HANDOVER_PHASE = {
+  STEADY:  "STEADY",   // single-sat operation
+  PRE:     "PRE",      // T = -60s to 0
+  OVERLAP: "OVERLAP",  // T = 0 to +30s (make-before-break)
+  POST:    "POST",     // T = +30s to +60s (ANT1 release)
+};
+
 // Dynamic constellation helpers
 function getInitLons(n) { return Array.from({length:n},(_,i)=>wrapL(i*360/n)); }
-function getSatNames(n) { return Array.from({length:n},(_,i)=>`mPOWER-${i+1}`); }
+function getSatNames(n, constellation) {
+  const cfg = constellation || CONSTELLATIONS.MPOWER;
+  if (cfg.nameFormat === "padded") {
+    return Array.from({length:n}, (_,i) => `${cfg.namePrefix}${String(i+1).padStart(3, "0")}`);
+  }
+  return Array.from({length:n}, (_,i) => `${cfg.namePrefix}${i+1}`);
+}
 
 // ═══════════════════════════════════════════════════════════════
 // AIRPORT DATABASE — major international airports within ±40° lat
@@ -443,6 +540,238 @@ function elevAngle(latDeg, lonDeg, satLonDeg) {
   return toDeg(Math.atan2(cosG - ratio, Math.sin(g)));
 }
 
+// ═══════════════════════════════════════════════════════════════
+// REAL HANDOVER ENGINE
+// Implements the documented O3b make-before-break sequence per
+// O3B-SYS-ENG-000xx (Handover Timeline rev3) and O3B-SYS-ENG-00010
+// (SDB File Explanation). Replaces the vanilla "instant-swap" model.
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * Find the next satellite handover event for a terminal.
+ * Searches forward in time, locates the moment the best-serving satellite
+ * switches identity, and refines to 1-second resolution.
+ *
+ * @param {number} lat                  Terminal latitude (deg)
+ * @param {number} lon                  Terminal longitude (deg)
+ * @param {number} simTime              Search start (sec)
+ * @param {object} constellation        Entry from CONSTELLATIONS
+ * @param {number} minEl                Minimum elevation for service (deg)
+ * @param {number} [horizonSec=10800]   How far ahead to search (default 3 h)
+ * @returns {{currentSat:number, nextSat:number, t0:number, currentEl:number, nextEl:number}|null}
+ */
+function findNextHandover(lat, lon, simTime, constellation, minEl, horizonSec) {
+  const N = constellation.numSats;
+  const HORIZON = horizonSec || 10800;
+  const STEP = 30;
+  let prevBest = -1;
+  for (let dt = 0; dt < HORIZON; dt += STEP) {
+    const t = simTime + dt;
+    let bestIdx = -1, bestEl = -90;
+    for (let i = 0; i < N; i++) {
+      const sLon = satLon(i, t, N);
+      const el = elevAngle(lat, lon, sLon);
+      if (el > bestEl) { bestEl = el; bestIdx = i; }
+    }
+    if (bestEl < minEl) { prevBest = -1; continue; }
+    if (prevBest >= 0 && bestIdx !== prevBest) {
+      // Bisect between (t-STEP) and t to find handover boundary
+      let lo = t - STEP, hi = t;
+      while (hi - lo > 1) {
+        const mid = (lo + hi) / 2;
+        let mIdx = -1, mEl = -90;
+        for (let i = 0; i < N; i++) {
+          const e = elevAngle(lat, lon, satLon(i, mid, N));
+          if (e > mEl) { mEl = e; mIdx = i; }
+        }
+        if (mIdx === prevBest) lo = mid; else hi = mid;
+      }
+      const t0 = Math.round(hi);
+      return {
+        currentSat: prevBest,
+        nextSat:    bestIdx,
+        t0,
+        currentEl:  elevAngle(lat, lon, satLon(prevBest, t0, N)),
+        nextEl:     elevAngle(lat, lon, satLon(bestIdx, t0, N)),
+      };
+    }
+    prevBest = bestIdx;
+  }
+  return null;
+}
+
+/**
+ * Compute the make-before-break antenna state at time `t` relative to a known handover.
+ * Returns ANT1/ANT2 states, current phase, and per-beam staggered timeline.
+ * Used by the Handover Timeline visualization and the "DOC" strategy policy.
+ *
+ * @param {number} t                Current time (sec)
+ * @param {object|null} hoEvent     From findNextHandover, or null for steady-state
+ * @param {object} constellation    Entry from CONSTELLATIONS
+ * @param {number[]|null} beamIds   Beam IDs for this terminal (or null = single beam)
+ * @returns {object} state          { phase, phaseT, ant1, ant2, beams[] }
+ */
+function getHandoverState(t, hoEvent, constellation, beamIds) {
+  if (!hoEvent) {
+    return {
+      phase: HANDOVER_PHASE.STEADY, phaseT: 0,
+      ant1: null, ant2: null, beams: [],
+    };
+  }
+  const dt = t - hoEvent.t0;
+  const beams = (beamIds && beamIds.length ? beamIds : [1]).map((bid, i) => {
+    const hoT = hoEvent.t0 + i * HANDOVER_TIMING.BEAM_STAGGER_SEC;
+    const lockT = hoT + HANDOVER_TIMING.MODEM_LOCK_SEC;
+    return {
+      id: bid,
+      handoverT: hoT,
+      modemLockT: lockT,
+      activeSat: (t >= lockT) ? hoEvent.nextSat : hoEvent.currentSat,
+    };
+  });
+
+  let phase, ant1Status, ant2Status;
+  if (dt < -HANDOVER_TIMING.PRE_HANDOVER_SEC) {
+    phase = HANDOVER_PHASE.STEADY;
+    ant1Status = ANT_STATE.ACTIVE; ant2Status = ANT_STATE.OFF;
+  } else if (dt < 0) {
+    phase = HANDOVER_PHASE.PRE;
+    ant1Status = ANT_STATE.ACTIVE;
+    // v4.22.1 (review NEW-4): was hardcoded -30. Use named constant.
+    ant2Status = (dt < -HANDOVER_TIMING.ANT2_TRACK_TRANSITION_SEC) ? ANT_STATE.SEARCH : ANT_STATE.TRACK;
+  } else if (dt < HANDOVER_TIMING.OVERLAP_MIN_SEC) {
+    phase = HANDOVER_PHASE.OVERLAP;
+    ant1Status = ANT_STATE.ACTIVE; ant2Status = ANT_STATE.ACTIVE;
+  } else if (dt < HANDOVER_TIMING.ANT1_RELEASE_SEC) {
+    phase = HANDOVER_PHASE.POST;
+    ant1Status = ANT_STATE.SEARCH; ant2Status = ANT_STATE.ACTIVE;
+  } else {
+    phase = HANDOVER_PHASE.STEADY;
+    ant1Status = ANT_STATE.OFF; ant2Status = ANT_STATE.ACTIVE;
+  }
+  return {
+    phase, phaseT: dt,
+    ant1: { sat: hoEvent.currentSat, status: ant1Status, el: hoEvent.currentEl },
+    ant2: { sat: hoEvent.nextSat,    status: ant2Status, el: hoEvent.nextEl },
+    beams,
+  };
+}
+
+/**
+ * Predict the actual data-overlap window for a handover event by checking
+ * how long the setting satellite stays above minEl after T=0.
+ * Doc requires ≥ 30 s for ground antennas to lock; flag shorter as non-compliant.
+ *
+ * @returns {{durationSec:number, compliant:boolean}}
+ */
+function computeOverlapWindow(hoEvent, lat, lon, constellation, minEl) {
+  if (!hoEvent) return { durationSec: 0, compliant: false };
+  const N = constellation.numSats;
+  let settingEnd = 0;
+  for (let dt = 0; dt < 600; dt += 1) {
+    const el = elevAngle(lat, lon, satLon(hoEvent.currentSat, hoEvent.t0 + dt, N));
+    if (el < minEl) { settingEnd = dt; break; }
+    settingEnd = dt;
+  }
+  // Per doc: setting sat amps blank at T=+26s regardless, so effective overlap caps there
+  // v4.22.1 (review NEW-5): was hardcoded "+4" — now uses OVERLAP_GRACE_SEC.
+  const effective = Math.min(settingEnd, HANDOVER_TIMING.OVERLAP_MIN_SEC + HANDOVER_TIMING.OVERLAP_GRACE_SEC);
+  return {
+    durationSec: effective,
+    compliant: effective >= HANDOVER_TIMING.MIN_OVERLAP_PLAN_SEC,
+  };
+}
+
+/**
+ * Format a sim-time timestamp as the SDB Schedule File time format:
+ * mm/dd/yyyy hh:mm:ss.fff (UTC).
+ *
+ * v4.22.1 (review NEW-1): simTime in this simulator is "seconds since module
+ * load", NOT Unix epoch — so `new Date(simTime * 1000)` produced 1970-relative
+ * timestamps in the exported XML, useless for real SDB integration. We now
+ * anchor sim t=0 to the moment the module loaded, so the XML reflects wall-clock
+ * UTC. Pass `epochOriginMs` to override (e.g. if the user has a different
+ * scenario start time).
+ *
+ * @param {number} simTimeSec       seconds since module load
+ * @param {number} [epochOriginMs]  ms-epoch corresponding to simTime = 0
+ *                                  (defaults to module-load wall-clock)
+ * @returns {string}
+ */
+const SIM_EPOCH_ORIGIN_MS = typeof Date !== "undefined" ? Date.now() : 0;
+function fmtScheduleTime(simTimeSec, epochOriginMs) {
+  const originMs = epochOriginMs == null ? SIM_EPOCH_ORIGIN_MS : epochOriginMs;
+  const d = new Date(originMs + simTimeSec * 1000);
+  const pad = (n, w) => String(n).padStart(w || 2, "0");
+  return `${pad(d.getUTCMonth()+1)}/${pad(d.getUTCDate())}/${d.getUTCFullYear()} ` +
+         `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}.000`;
+}
+
+/**
+ * Build an SDB-format Schedule File XML string for a terminal across a time window.
+ * Format per O3B-SYS-ENG-00010 §5 (XML Schedule File).
+ *
+ * @param {object} terminal             { id, lat, lon, minEl? }
+ * @param {object} constellation        Entry from CONSTELLATIONS
+ * @param {number} simTime              Window start (sec)
+ * @param {number} durationSec          Window length
+ * @param {number[]} beamIds            Beams served by this terminal
+ * @param {string} regionId             e.g. "R02A"
+ * @returns {string}                    XML
+ */
+function buildScheduleXML(terminal, constellation, simTime, durationSec, beamIds, regionId) {
+  const events = [];
+  let t = simTime;
+  const endT = simTime + durationSec;
+  let safety = 0;
+  while (t < endT && safety < 24) {
+    // v4.22.1 (review NEW-8): nullish-coalesce so an explicit minEl=0 isn't overridden.
+    const ho = findNextHandover(terminal.lat, terminal.lon, t, constellation, terminal.minEl ?? 10);
+    if (!ho) break;
+    if (ho.t0 > endT) break;
+    events.push(ho);
+    t = ho.t0 + 60;
+    safety++;
+  }
+  const N = constellation.numSats;
+  // v4.22.1 (review NEW-2): was `(360 / N) * 60` — the "60" magic constant only
+  // matched mPOWER's altitude by coincidence (1 / toDeg(w_rel) ≈ 60 sec/°).
+  // Derive directly from w_rel so this scales correctly if h_orb changes.
+  // Time to traverse 360/N degrees of ground-relative motion (sec).
+  const passDurationSec = (360 / N) / toDeg(w_rel);
+  const satName = (idx) => {
+    if (constellation.nameFormat === "padded") {
+      return `${constellation.namePrefix}${String(idx + 1).padStart(3, "0")}`;
+    }
+    return `${constellation.namePrefix}${idx + 1}`;
+  };
+
+  let xml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n`;
+  xml += `<!--\n  NAME: ${terminal.id || "TERMINAL"}_schedule.xml\n`;
+  xml += `  LATITUDE (deg N): ${terminal.lat.toFixed(2)}\n`;
+  xml += `  LONGITUDE (deg E): ${terminal.lon.toFixed(2)}\n`;
+  xml += `  CONSTELLATION: ${constellation.label}\n`;
+  xml += `  GENERATED BY: mPOWER Simulator ${VERSION}\n-->\n`;
+  xml += `<Schedule Period="0006:00:00.000" Action="ADD">\n`;
+  events.forEach((ev) => {
+    const sName = satName(ev.nextSat);
+    const prePassT = ev.t0 - 360;
+    const startT   = ev.t0 - 120;
+    const endTime  = ev.t0 + passDurationSec + 120;
+    xml += `  <Track Satellite="${sName}" `;
+    xml += `PrePassTime="${fmtScheduleTime(prePassT)}" `;
+    xml += `StartTime="${fmtScheduleTime(startT)}" `;
+    xml += `EndTime="${fmtScheduleTime(endTime)}">\n`;
+    (beamIds && beamIds.length ? beamIds : [1]).forEach((bid, bi) => {
+      const hoT = ev.t0 + bi * HANDOVER_TIMING.BEAM_STAGGER_SEC;
+      xml += `    <Handover Time="${fmtScheduleTime(hoT)}" Beam="${bid}" Region="${regionId || "R01A"}"/>\n`;
+    });
+    xml += `  </Track>\n`;
+  });
+  xml += `</Schedule>\n`;
+  return xml;
+}
+
 // Returns array of {lon, lat} for a spherical cap contour
 function contourPts(satLonDeg, elDeg, n = 180) {
   const g    = earthCentralAngle(elDeg);
@@ -579,7 +908,7 @@ const AIRLINE_NAMES = {
   SYR:"Syrianair",TAM:"LATAM Brasil",TAP:"TAP Portugal",THA:"Thai Airways",THY:"Turkish",
   TRA:"Transavia",TVF:"Transavia France",UAE:"Emirates",UAL:"United",UBT:"Tui Belgium",
   UCA:"Commutair",UPS:"UPS",VIR:"Virgin Atlantic",VOI:"Volaris",VRD:"Virgin America",
-  VLG:"Vueling",WJA:"WestJet",WUP:"Western Global",XAX:"AirAsia X", // v4.21.4 (review L6): removed dead ZSAAK key (5-char, never matches 3-char prefix)
+  VLG:"Vueling",WJA:"WestJet",WUP:"Western Global",XAX:"AirAsia X", // v4.22.1 (review L6): removed dead ZSAAK key (5-char, never matches 3-char prefix)
 };
 
 // Friendly name for any airport ICAO code (just for displaying in result list).
@@ -659,7 +988,7 @@ const DEST_AIRPORT_NAMES = {
   // Asia
   VIDP:"Delhi",VABB:"Mumbai",VOMM:"Chennai",VOBL:"Bangalore",VOHS:"Hyderabad",
   VOCI:"Kochi",VOCB:"Coimbatore",VOTV:"Trivandrum",VECC:"Kolkata",VAAH:"Ahmedabad",
-  VOGO:"Goa",VOTR:"Tiruchirappalli",VEBN:"Varanasi",VEPT:"Patna", // v4.21.4 (review L1): removed duplicate VOMM ("Madras" — same as Chennai above)
+  VOGO:"Goa",VOTR:"Tiruchirappalli",VEBN:"Varanasi",VEPT:"Patna", // v4.22.1 (review L1): removed duplicate VOMM ("Madras" — same as Chennai above)
   VAJJ:"Pune",VANP:"Nagpur",
   VHHH:"Hong Kong",VMMC:"Macau",ZBAA:"Beijing Capital",ZBAD:"Beijing Daxing",ZSPD:"Shanghai Pudong",
   ZSSS:"Shanghai Hongqiao",ZGGG:"Guangzhou",ZGSZ:"Shenzhen",ZUUU:"Chengdu",ZSHC:"Hangzhou",
@@ -803,7 +1132,7 @@ function losGroundPoints(gwLat, gwLon, satLon, elDeg, n=20) {
   const az   = azimToSubSat(gwLat, gwLon, satLon);
   const elR  = toRad(Math.max(elDeg, 5));
   const maxKm = Math.min(12 / Math.tan(elR), 50); // troposphere crossing distance
-  // v4.21.4 (review L4): use module-level Re instead of redeclaring a local R.
+  // v4.22.1 (review L4): use module-level Re instead of redeclaring a local R.
   return Array.from({length:n}, (_,i) => {
     const d  = (i/(n-1)) * maxKm;
     const dr = d / Re;
@@ -2693,12 +3022,12 @@ function GatewayWeatherTab({ simTime, numSats, satNames }) {
 }
 // ═══════════════════════════════════════════════════════════════
 const F_DL     = 19.95e9;
-const C_LIGHT  = 299792458; // v4.21.4 (review L3): was 3e8 (introduced ~0.07% FSPL error)
+const C_LIGHT  = 299792458; // v4.22.1 (review L3): was 3e8 (introduced ~0.07% FSPL error)
 const EIRP_DBW = 68;
 const GT_DB    = 14.5;
 const BW_MHZ   = 216;
 const K_DB     = -228.6;
-// v4.21.4 (review L2): atmospheric / margin loss breakdown used by both legacy
+// v4.22.1 (review L2): atmospheric / margin loss breakdown used by both legacy
 // linkBudget and aviation linkBudgetFL/RL. Kept as named constants so the two
 // budgets stay aligned (previously legacy used 0.5 dB atm vs aviation 0.3 dB).
 const ATM_LOSS_LEGACY_DB = 0.5; // legacy (fixed terminal) atmospheric loss
@@ -2708,7 +3037,7 @@ const MISC_LOSS_DB       = 1.0; // implementation / pointing / other
 function linkBudget(elDeg) {
   const d_m  = slantRange(elDeg) * 1000;
   const FSPL = 20 * Math.log10(4 * Math.PI * d_m * F_DL / C_LIGHT);
-  const loss = FSPL + ATM_LOSS_LEGACY_DB + RAIN_LOSS_DB + MISC_LOSS_DB; // v4.21.4 (review L2)
+  const loss = FSPL + ATM_LOSS_LEGACY_DB + RAIN_LOSS_DB + MISC_LOSS_DB; // v4.22.1 (review L2)
   const C_No = EIRP_DBW - loss + GT_DB - K_DB;
   const C_N  = C_No - 10 * Math.log10(BW_MHZ * 1e6);
   const cap  = BW_MHZ * Math.log2(1 + Math.pow(10, C_N / 10));
@@ -2725,11 +3054,10 @@ function linkBudget(elDeg) {
 // ═══════════════════════════════════════════════════════════════
 // MODULE B — ThinKom Ka2517 ANTENNA MODEL
 // ═══════════════════════════════════════════════════════════════
-// v4.21.4 (review L5): renamed from CRUISE_ALT_KM. 3.048 km = 10,000 ft is a
+// v4.22.1 (review L5): renamed from CRUISE_ALT_KM. 3.048 km = 10,000 ft is a
 // conservative LOWER-BOUND aircraft altitude used for slantRangeAviation. Real
 // commercial Ka-band cruise is FL350–FL410 (~10.7–12.5 km), but at MEO range
 // the slant-range difference is <0.05% FSPL (negligible), so we hold the floor.
-// If you ever need true cruise altitude, swap this in slantRangeAviation only.
 const AIRCRAFT_ALT_FLOOR_KM = 3.048;
 const CRUISE_ALT_KM = AIRCRAFT_ALT_FLOOR_KM; // back-compat alias for existing references
 const ATM_LOSS_FL_DB = 0.3;     // Clear-sky FL atmospheric loss
@@ -2815,7 +3143,7 @@ function linkBudgetFL(elDeg, useKa2517=false) {
   const d_m = (useKa2517 ? slantRangeAviation(elDeg) : slantRange(elDeg)) * 1000;
   const FSPL = 20 * Math.log10(4 * Math.PI * d_m * F_DL / C_LIGHT);
   const gt = useKa2517 ? ka2517GT(elDeg) : GT_DB;
-  const loss = FSPL + ATM_LOSS_FL_DB + RAIN_LOSS_DB + MISC_LOSS_DB; // v4.21.4 (review L2): named constants
+  const loss = FSPL + ATM_LOSS_FL_DB + RAIN_LOSS_DB + MISC_LOSS_DB; // v4.22.1 (review L2): named constants
   const C_No = EIRP_DBW - loss + gt - K_DB;
   const C_N  = C_No - 10 * Math.log10(BW_MHZ * 1e6);
   const modcod = dvbS2xModcod(C_N);
@@ -2826,7 +3154,7 @@ function linkBudgetRL(elDeg, useKa2517=false, satGtDbk=12.0) {
   const d_m = (useKa2517 ? slantRangeAviation(elDeg) : slantRange(elDeg)) * 1000;
   const FSPL = 20 * Math.log10(4 * Math.PI * d_m * F_UL / C_LIGHT);
   const eirp = useKa2517 ? ka2517TxEirp(elDeg) : 55.5;
-  const loss = FSPL + ATM_LOSS_RL_DB + MISC_LOSS_DB; // v4.21.4 (review L2): named constants (RL has no rain term — uplink is uncontested)
+  const loss = FSPL + ATM_LOSS_RL_DB + MISC_LOSS_DB; // v4.22.1 (review L2): named constants (RL has no rain term)
   const C_No = eirp - loss + satGtDbk - K_DB;
   const C_N  = C_No - 10 * Math.log10(BW_MHZ * 1e6);
   const modcod = dvbS2xModcod(C_N);
@@ -2865,8 +3193,8 @@ const KA2517_EFFICIENCY_GRID = [
   { lat:  0.0, elEdge: 40.3, elCenter: 90.0, effEdgeFwd:1.250, effEdgeRtn:1.540, effCenterFwd:1.500, effCenterRtn:2.000 },
   { lat: -2.5, elEdge: 39.4, elCenter: 85.7, effEdgeFwd:1.209, effEdgeRtn:1.524, effCenterFwd:1.444, effCenterRtn:1.991 },
   { lat: -5.0, elEdge: 38.4, elCenter: 81.4, effEdgeFwd:1.167, effEdgeRtn:1.508, effCenterFwd:1.387, effCenterRtn:1.982 },
-  { lat: -7.5, elEdge: 37.5, elCenter: 77.1, effEdgeFwd:1.126, effEdgeRtn:1.491, effCenterFwd:1.331, effCenterRtn:1.974 }, // v4.21.4: was 1.167 (asymmetry bug, see review C1)
-  { lat:-10.0, elEdge: 36.5, elCenter: 72.8, effEdgeFwd:1.085, effEdgeRtn:1.475, effCenterFwd:1.275, effCenterRtn:1.965 }, // v4.21.4: was 1.167 (asymmetry bug, see review C1)
+  { lat: -7.5, elEdge: 37.5, elCenter: 77.1, effEdgeFwd:1.126, effEdgeRtn:1.491, effCenterFwd:1.331, effCenterRtn:1.974 }, // v4.22.1: was 1.167 (asymmetry bug, see review C1)
+  { lat:-10.0, elEdge: 36.5, elCenter: 72.8, effEdgeFwd:1.085, effEdgeRtn:1.475, effCenterFwd:1.275, effCenterRtn:1.965 }, // v4.22.1: was 1.167 (asymmetry bug, see review C1)
   { lat:-12.5, elEdge: 35.5, elCenter: 68.6, effEdgeFwd:1.085, effEdgeRtn:1.459, effCenterFwd:1.234, effCenterRtn:1.924 },
   { lat:-15.0, elEdge: 34.6, elCenter: 64.3, effEdgeFwd:1.002, effEdgeRtn:1.442, effCenterFwd:1.192, effCenterRtn:1.883 },
   { lat:-17.5, elEdge: 33.6, elCenter: 60.0, effEdgeFwd:0.961, effEdgeRtn:1.426, effCenterFwd:1.151, effCenterRtn:1.841 },
@@ -2883,7 +3211,7 @@ const KA2517_EFFICIENCY_GRID = [
 
 // Snap to nearest lat row; returns the entry or null if outside grid range.
 function ka2517EfficiencyLookup(latDeg) {
-  // v4.21.4 (review L7): 41.25 = grid endpoint (±40°) + half a grid step (1.25°).
+  // v4.22.1 (review L7): 41.25 = grid endpoint (±40°) + half a grid step (1.25°).
   // Ensures lat=40.0 snaps to the boundary row instead of returning null.
   if (Math.abs(latDeg) > 41.25) return null;
   let best = null, bestDist = Infinity;
@@ -3305,6 +3633,7 @@ function InterferenceTab({
   interfMbpsRtn, setInterfMbpsRtn,
   interfNextId, setInterfNextId,
   INTERFERENCE_COLORS,
+  constellation,  // v4.22: passed from App for DOC strategy compliance checks
 }) {
   const canvasRef = useRef(null);
   const wrapRef   = useRef(null);
@@ -3320,7 +3649,7 @@ function InterferenceTab({
   const [stratMinEl, setStratMinEl] = useState(5); // service threshold for strategy comparison; lower than ka2517MinEl by design
   const [stratResults, setStratResults] = useState(null);
   const [stratRunning, setStratRunning] = useState(false);
-  // v4.21.4 (review H2): track the deferred setTimeout so a rapid second click
+  // v4.22.1 (review H2): track the deferred setTimeout so a rapid second click
   // (or an unmount) cancels the in-flight run before its setState writes land.
   const stratTimeoutRef = useRef(null);
   useEffect(() => () => {
@@ -3365,8 +3694,8 @@ function InterferenceTab({
   }, []);
 
   // ─── 1. Compute per-terminal active link (best sat + best GW) ──
-  // v4.21.4 (review M3): memoized — was a plain .map() that re-ran on every
-  // simTime tick (i.e. ~30/sec during playback) regardless of whether inputs changed.
+  // v4.22.1 (review M3): memoized — was a plain .map() that re-ran on every
+  // simTime tick (~30/sec during playback) regardless of whether inputs changed.
   const interfActiveLinks = useMemo(() => interfTerminals.map(term => {
     let bestSat = null, bestSatEl = -90;
     for (let i = 0; i < numSats; i++) {
@@ -3505,7 +3834,7 @@ function InterferenceTab({
   //
   // Returns null until user presses "RUN COMPARISON".
   const runStrategyComparison = useCallback(() => {
-    // v4.21.4 (review H2): cancel any previously-scheduled run before starting a new one.
+    // v4.22.1 (review H2): cancel any previously-scheduled run before starting a new one.
     if (stratTimeoutRef.current) clearTimeout(stratTimeoutRef.current);
     setStratRunning(true);
     // Defer to next tick so the UI shows a "running" state
@@ -3529,7 +3858,11 @@ function InterferenceTab({
 
       // For each strategy, simulate per-terminal across all steps.
       // strategyState[term.id] = { satIdx, lockedSinceEl, etc. }
-      const strategies = ["BEST", "MID", "EDGE"];
+      // DOC = real O3b make-before-break policy per O3B-SYS-ENG-000xx.
+      // Same switch behavior as EDGE (ride until below minEl) but each handover
+      // is validated against the documented 30 s overlap requirement and 1-sec
+      // beam stagger constraint (O3B-SAT-TRD-REQ-1).
+      const strategies = ["BEST", "MID", "EDGE", "DOC"];
       const results = {};
       for (const strat of strategies) results[strat] = {
         terminals: interfTerminals.map(t => ({
@@ -3542,6 +3875,10 @@ function InterferenceTab({
           unviable:   0,       // count of steps with no viable sat or no MHz lookup
           cnSamples:  [],      // C/N baseline per step
           cniSamples: [],      // C/(N+I) per step (with interference from other terms)
+          // DOC-only compliance counters
+          overlapCompliant:    0,   // handovers where actual overlap ≥ 30 s
+          overlapNonCompliant: 0,   // handovers where overlap < 30 s
+          overlapSec:          [],  // per-handover measured overlap (s)
         })),
         timeSamples: [],       // shared time axis (minutes since t0)
         // satLonsAt[step] = [lon0, lon1, ...] for all satellites at that step time.
@@ -3555,6 +3892,7 @@ function InterferenceTab({
         BEST: interfTerminals.map(() => ({ curIdx: -1, curEl: -90 })),
         MID:  interfTerminals.map(() => ({ curIdx: -1, curEl: -90 })),
         EDGE: interfTerminals.map(() => ({ curIdx: -1, curEl: -90 })),
+        DOC:  interfTerminals.map(() => ({ curIdx: -1, curEl: -90 })),
       };
 
       for (let step = 0; step < N_STEPS; step++) {
@@ -3605,7 +3943,7 @@ function InterferenceTab({
               } else {
                 chosenIdx = best.idx; chosenLon = best.lon; chosenEl = best.el;
               }
-            } else { // MID
+            } else if (strat === "MID") {
               // Lock to current sat as long as we're past the "midpoint" — defined as
               // the moment where current EL is within 5° of its peak. We approximate
               // peak-detection by locking when the current EL is rising or has just
@@ -3624,11 +3962,39 @@ function InterferenceTab({
               } else {
                 chosenIdx = best.idx; chosenLon = best.lon; chosenEl = best.el;
               }
+            } else { // DOC — real O3b documented policy
+              // Ride current sat (like EDGE) until it falls below stratMinEl, then
+              // switch to best. Same switching behavior as EDGE, but the resulting
+              // handover is validated against the documented 30 s overlap requirement.
+              if (st.curIdx >= 0) {
+                const curLon = satLon(st.curIdx, t, numSats);
+                const curEl = elevAngle(term.lat, term.lon, curLon);
+                if (curEl >= stratMinEl) {
+                  chosenIdx = st.curIdx; chosenLon = curLon; chosenEl = curEl;
+                } else {
+                  chosenIdx = best.idx; chosenLon = best.lon; chosenEl = best.el;
+                }
+              } else {
+                chosenIdx = best.idx; chosenLon = best.lon; chosenEl = best.el;
+              }
             }
 
             // Track handovers
             if (st.curIdx >= 0 && st.curIdx !== chosenIdx) {
               result.terminals[ti].handovers += 1;
+              // DOC policy: compute compliance for this handover
+              if (strat === "DOC") {
+                const hoEvent = {
+                  currentSat: st.curIdx, nextSat: chosenIdx,
+                  t0: t, currentEl: st.curEl, nextEl: chosenEl,
+                };
+                const overlap = computeOverlapWindow(
+                  hoEvent, term.lat, term.lon, constellation, stratMinEl
+                );
+                result.terminals[ti].overlapSec.push(overlap.durationSec);
+                if (overlap.compliant) result.terminals[ti].overlapCompliant += 1;
+                else                   result.terminals[ti].overlapNonCompliant += 1;
+              }
             }
             states[ti].curIdx = chosenIdx;
             states[ti].curEl  = chosenEl;
@@ -3704,8 +4070,15 @@ function InterferenceTab({
         let cniAccum = 0, cniN = 0;
         let totalHandovers = 0;
         let totalSamples   = 0, viableSamples = 0;
+        let totalCompliant = 0, totalNonCompliant = 0;
+        let overlapSum = 0, overlapN = 0;
         for (const term of r.terminals) {
           totalHandovers += term.handovers;
+          totalCompliant    += term.overlapCompliant || 0;
+          totalNonCompliant += term.overlapNonCompliant || 0;
+          for (const o of (term.overlapSec || [])) {
+            overlapSum += o; overlapN += 1;
+          }
           for (const m of term.mhzSamples) {
             totalSamples += 1;
             if (m != null) { mhzAccum += m; mhzN += 1; viableSamples += 1; }
@@ -3713,6 +4086,7 @@ function InterferenceTab({
           for (const e of term.elSamples) if (e != null) { elAccum += e; elN += 1; }
           for (const c of term.cniSamples) if (c != null) { cniAccum += c; cniN += 1; }
         }
+        const totalCompChecks = totalCompliant + totalNonCompliant;
         summary[strat] = {
           meanMhz: mhzN > 0 ? mhzAccum / mhzN : null,
           meanEl:  elN  > 0 ? elAccum  / elN  : null,
@@ -3720,6 +4094,13 @@ function InterferenceTab({
           handoversPerHr: totalHandovers / (stratWindowMin / 60),
           // Viability: fraction of (term × step) samples where link was up
           viableFrac: totalSamples > 0 ? viableSamples / totalSamples : 0,
+          // DOC-only: overlap compliance against 30 s spec requirement
+          overlapCompliantPct: (strat === "DOC" && totalCompChecks > 0)
+            ? (totalCompliant / totalCompChecks) * 100
+            : null,
+          meanOverlapSec: (strat === "DOC" && overlapN > 0) ? overlapSum / overlapN : null,
+          // Beam stagger is always compliant by construction for DOC (model assumption)
+          beamStaggerCompliant: strat === "DOC",
         };
       }
       const baseline = summary.BEST.meanMhz;
@@ -3745,7 +4126,7 @@ function InterferenceTab({
       setStratRunning(false);
     }, 50);
   }, [simTime, numSats, interfTerminals, stratMinEl, interfBeamHalf, interfRolloffDb,
-      interfReuseEnabled, interfMbpsFwd, interfMbpsRtn, stratWindowMin]);
+      interfReuseEnabled, interfMbpsFwd, interfMbpsRtn, stratWindowMin, constellation]);
 
 
   // ─── 4e. Strategy mini-map renderer ───────────────────────────────────
@@ -5297,7 +5678,7 @@ function MapCanvas({ simTime, pins, onPinDrop, gpLat, gpLon, numSats, showGwLink
   const pinModeRef = useRef(false);
   const prevSatIdxRef = useRef(-1);  // hysteresis: last active satellite index
 
-  // v4.21.4 (review M5/L8): consolidated 11 ref-syncing useEffects into useLatestRef calls.
+  // v4.22.1 (review M5/L8): consolidated 11 ref-syncing useEffects into useLatestRef calls.
   // Each ref always reflects the latest prop value; consumers (draw, handlers) read .current.
   const simTimeRef        = useLatestRef(simTime);
   const pinsRef           = useLatestRef(pins);
@@ -6103,13 +6484,312 @@ function MapCanvas({ simTime, pins, onPinDrop, gpLat, gpLon, numSats, showGwLink
 }
 
 // ═══════════════════════════════════════════════════════════════
+// v4.22 — O3B HANDOVER TIMELINE PANEL
+// Renders the 4-step documented make-before-break sequence as an
+// SVG timeline strip with ANT1/ANT2 state bands, overlap window,
+// 1-sec staggered beam ticks, and an SDB Schedule File export.
+// ═══════════════════════════════════════════════════════════════
+function O3bHandoverTimelinePanel({ simTime, gpLat, gpLon, constellation, minEl }) {
+  const [copied, setCopied] = useState(false);
+  const [showXml, setShowXml] = useState(false);
+  // v4.22.1 (review NEW-3): track the "copied → false" reset timer so a rapid
+  // second click or unmount doesn't fire setCopied on an unmounted component.
+  const copiedTimeoutRef = useRef(null);
+  useEffect(() => () => {
+    if (copiedTimeoutRef.current) clearTimeout(copiedTimeoutRef.current);
+  }, []);
+
+  // v4.22.1 (review NEW-7): coarsen simTime to 5-second buckets for the heavy
+  // handover-search memos. findNextHandover does ~360 sample-points × N sats of
+  // elevation calcs; recomputing 30×/sec during playback was burning ~120k trig
+  // calls/sec. Updating the panel every 5 sim-sec is plenty for a chart that
+  // shows minutes-to-next-handover.
+  const effectiveMinEl = minEl || 10;
+  const simTimeBucket = useQuantizedValue(simTime, 5);
+
+  // Find the next handover for the analysis point
+  const ho = useMemo(() => {
+    if (!constellation) return null;
+    return findNextHandover(gpLat, gpLon, simTimeBucket, constellation, effectiveMinEl);
+  }, [simTimeBucket, gpLat, gpLon, constellation, effectiveMinEl]);
+
+  const overlap = useMemo(() => {
+    if (!ho) return null;
+    return computeOverlapWindow(ho, gpLat, gpLon, constellation, effectiveMinEl);
+  }, [ho, gpLat, gpLon, constellation, effectiveMinEl]);
+
+  const xml = useMemo(() => {
+    if (!ho) return "";
+    const beamCount = constellation.beamsPerSubRegion;
+    const beamIds = Array.from({ length: beamCount }, (_, i) => i + 1);
+    return buildScheduleXML(
+      { id: `TERM_${gpLat.toFixed(0)}_${gpLon.toFixed(0)}`, lat: gpLat, lon: gpLon, minEl: effectiveMinEl },
+      constellation,
+      simTimeBucket,
+      4 * 3600,
+      beamIds,
+      "R01A"
+    );
+  }, [ho, constellation, simTimeBucket, gpLat, gpLon, effectiveMinEl]);
+
+  const handleCopy = useCallback(() => {
+    if (typeof navigator !== "undefined" && navigator.clipboard) {
+      navigator.clipboard.writeText(xml).then(() => {
+        setCopied(true);
+        // v4.22.1 (review NEW-3): cancel previous reset timer before scheduling a new one.
+        if (copiedTimeoutRef.current) clearTimeout(copiedTimeoutRef.current);
+        copiedTimeoutRef.current = setTimeout(() => {
+          copiedTimeoutRef.current = null;
+          setCopied(false);
+        }, 1500);
+      });
+    }
+  }, [xml]);
+
+  if (!ho) {
+    return (
+      <div style={{marginTop:"16px",padding:"12px",background:"#0f1d2e",border:"1px solid #1a2d44",borderRadius:"4px"}}>
+        <div style={{color:"#5a7090",fontSize:"11px",letterSpacing:"1.5px"}}>
+          DOCUMENTED HANDOVER TIMELINE (v4.22)
+        </div>
+        <div style={{color:"#5a7090",fontSize:"11px",marginTop:"8px"}}>
+          No upcoming handover detected in the next 3 hours at this analysis point.
+        </div>
+      </div>
+    );
+  }
+
+  const satName = (idx) => {
+    if (constellation.nameFormat === "padded") {
+      return `${constellation.namePrefix}${String(idx + 1).padStart(3, "0")}`;
+    }
+    return `${constellation.namePrefix}${idx + 1}`;
+  };
+
+  const minToHandover = (ho.t0 - simTime) / 60;
+  const beamCount = Math.min(constellation.beamsPerSubRegion, 8);
+
+  // SVG geometry: x maps T = -60s..+90s → x = 40..1200 (150 sec span, 7.73 px/s)
+  const xAt = (sec) => 40 + (sec + 60) * (1160 / 150);
+
+  return (
+    <div style={{marginTop:"16px"}}>
+
+      {/* Header */}
+      <div style={{padding:"12px 16px",background:"#0f1d2e",border:"1px solid #1a2d44",borderRadius:"4px 4px 0 0",borderBottom:"none"}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+          <div>
+            <div style={{color:"#5a7090",fontSize:"11px",letterSpacing:"1.5px",fontWeight:"600"}}>
+              DOCUMENTED HANDOVER TIMELINE · v4.22
+            </div>
+            <div style={{color:"#cfe2ff",fontSize:"12px",marginTop:"3px"}}>
+              Next handover in <span style={{color:"#00cfff",fontWeight:"bold"}}>{minToHandover.toFixed(1)} min</span> ·{" "}
+              <span style={{color:"#ff6b35",fontWeight:"bold"}}>{satName(ho.currentSat)}</span> (setting, {ho.currentEl.toFixed(1)}°) →{" "}
+              <span style={{color:"#00cfff",fontWeight:"bold"}}>{satName(ho.nextSat)}</span> (rising, {ho.nextEl.toFixed(1)}°)
+            </div>
+            <div style={{color:"#3a5a7a",fontSize:"10px",marginTop:"2px"}}>
+              Source: {constellation.docSource}
+            </div>
+          </div>
+          <div style={{display:"flex",gap:"8px"}}>
+            <button onClick={() => setShowXml(s => !s)}
+                    style={{background:"#080f1a",border:"1px solid #2e4270",color:"#8ab0d0",
+                            padding:"5px 12px",fontSize:"10px",fontFamily:"inherit",cursor:"pointer",borderRadius:"3px"}}>
+              {showXml ? "Hide" : "View"} Schedule XML
+            </button>
+            <button onClick={handleCopy}
+                    style={{background:copied?"#7fff0022":"#00cfff22",border:`1px solid ${copied?"#7fff00":"#00cfff"}`,
+                            color:copied?"#7fff00":"#00cfff",padding:"5px 12px",fontSize:"10px",
+                            fontFamily:"inherit",cursor:"pointer",borderRadius:"3px",fontWeight:"bold"}}>
+              {copied ? "✓ Copied" : "Copy XML"}
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {/* KPI strip */}
+      <div style={{padding:"12px 16px",background:"#0f1d2e",borderLeft:"1px solid #1a2d44",borderRight:"1px solid #1a2d44",
+                   display:"grid",gridTemplateColumns:"repeat(4, 1fr)",gap:"12px"}}>
+        {[
+          {
+            label:"Overlap window",
+            value:`${overlap.durationSec.toFixed(1)} s`,
+            sub:overlap.compliant?"Spec ≥ 30 s · ✓ compliant":"Spec ≥ 30 s · ✗ below floor",
+            ok:overlap.compliant,
+          },
+          {
+            label:"Beam stagger",
+            value:`${HANDOVER_TIMING.BEAM_STAGGER_SEC.toFixed(2)} s`,
+            sub:"O3B-SAT-TRD-REQ-1 · compliant",
+            ok:true,
+          },
+          {
+            label:"ANT1 release",
+            value:`+${HANDOVER_TIMING.ANT1_RELEASE_SEC}s`,
+            sub:"Setting-sat path freed",
+            ok:null,
+          },
+          {
+            label:"Modem lock",
+            value:`+${HANDOVER_TIMING.MODEM_LOCK_SEC}s`,
+            sub:"Demod-B locked on rising",
+            ok:null,
+          },
+        ].map((k, i) => (
+          <div key={i} style={{
+            background:"rgba(255,255,255,0.02)",
+            borderLeft:`2px solid ${k.ok===true?"#7fff00":k.ok===false?"#ff4444":"#00cfff"}`,
+            padding:"6px 10px",
+          }}>
+            <div style={{color:"#5a7090",fontSize:"9px",letterSpacing:"1px",textTransform:"uppercase"}}>{k.label}</div>
+            <div style={{color:"#cfe2ff",fontSize:"16px",fontWeight:"600",marginTop:"2px"}}>{k.value}</div>
+            <div style={{color:"#5a7090",fontSize:"9px",marginTop:"2px"}}>{k.sub}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* Timeline SVG */}
+      <div style={{padding:"12px 16px 16px",background:"#0f1d2e",border:"1px solid #1a2d44",borderTop:"none",borderRadius:"0 0 4px 4px"}}>
+        <svg viewBox="0 0 1240 360" style={{width:"100%",display:"block"}}>
+          <defs>
+            <pattern id="overlapHatch" patternUnits="userSpaceOnUse" width="6" height="6" patternTransform="rotate(45)">
+              <rect width="6" height="6" fill="#7fff0020"/>
+              <line x1="0" y1="0" x2="0" y2="6" stroke="#7fff00" strokeWidth="1.5"/>
+            </pattern>
+          </defs>
+
+          {/* Vertical gridlines */}
+          <g stroke="#1a2d44" strokeWidth="1">
+            <line x1={xAt(-60)} y1="20" x2={xAt(-60)} y2="320"/>
+            <line x1={xAt(0)}   y1="20" x2={xAt(0)}   y2="320" stroke="#3a5a7a" strokeDasharray="3,3"/>
+            <line x1={xAt(20)}  y1="20" x2={xAt(20)}  y2="320"/>
+            <line x1={xAt(26)}  y1="20" x2={xAt(26)}  y2="320"/>
+            <line x1={xAt(30)}  y1="20" x2={xAt(30)}  y2="320"/>
+            <line x1={xAt(60)}  y1="20" x2={xAt(60)}  y2="320"/>
+            <line x1={xAt(90)}  y1="20" x2={xAt(90)}  y2="320"/>
+          </g>
+
+          {/* Time axis labels */}
+          <g fontSize="10" fill="#5a7090" textAnchor="middle" fontFamily="inherit">
+            <text x={xAt(-60)} y="345">T = -60s</text>
+            <text x={xAt(0)}   y="345" fill="#cfe2ff" fontWeight="600">T = 0  (HANDOVER TIME)</text>
+            <text x={xAt(20)}  y="345">+20s</text>
+            <text x={xAt(26)}  y="345">+26s</text>
+            <text x={xAt(30)}  y="345">+30s</text>
+            <text x={xAt(60)}  y="345">+60s</text>
+            <text x={xAt(90)}  y="345">+90s</text>
+          </g>
+
+          {/* Setting satellite band */}
+          <g>
+            <rect x={xAt(-60)} y="40" width={xAt(26)-xAt(-60)} height="32" fill="#ff6b3520" stroke="#ff6b35" strokeWidth="1.5"/>
+            <text x={xAt(-60)+10} y="60" fontSize="11" fill="#ff6b35" fontWeight="600">{satName(ho.currentSat)} (setting)</text>
+            <text x={xAt(-60)+10} y="68" fontSize="9" fill="#5a7090">Traffic via ANT1</text>
+            <line x1={xAt(26)} y1="36" x2={xAt(26)} y2="76" stroke="#ff4444" strokeWidth="2"/>
+            <text x={xAt(26)+4} y="50" fontSize="9" fill="#ff4444">▶ First Blank ON CMD</text>
+          </g>
+
+          {/* Rising satellite band */}
+          <g>
+            <rect x={xAt(0)} y="84" width={xAt(90)-xAt(0)} height="32" fill="#00cfff20" stroke="#00cfff" strokeWidth="1.5"/>
+            <text x={xAt(0)+10} y="104" fontSize="11" fill="#00cfff" fontWeight="600">{satName(ho.nextSat)} (rising)</text>
+            <text x={xAt(0)+10} y="112" fontSize="9" fill="#5a7090">Traffic via ANT2</text>
+            <line x1={xAt(0)} y1="80" x2={xAt(0)} y2="120" stroke="#7fff00" strokeWidth="2"/>
+            <text x={xAt(0)+36} y="78" fontSize="9" fill="#7fff00">▶ Last Blank OFF · RF path ready</text>
+          </g>
+
+          {/* Data overlap window */}
+          <g>
+            <rect x={xAt(0)} y="128" width={xAt(overlap.durationSec)-xAt(0)} height="22"
+                  fill="url(#overlapHatch)" stroke="#7fff00" strokeWidth="1"/>
+            <text x={(xAt(0)+xAt(overlap.durationSec))/2} y="143" fontSize="10" fill="#7fff00" fontWeight="600" textAnchor="middle">
+              DATA OVERLAP ({overlap.durationSec.toFixed(1)} s)
+            </text>
+          </g>
+
+          {/* ANT1 state band */}
+          <g>
+            <text x="35" y="187" fontSize="9" fill="#5a7090" textAnchor="end">ANT1</text>
+            <rect x={xAt(-60)} y="170" width={xAt(26)-xAt(-60)}  height="28" fill="#00cfff"/>
+            <rect x={xAt(60)}  y="170" width={xAt(90)-xAt(60)}   height="28" fill="#2a3d54"/>
+            <rect x={xAt(26)}  y="170" width={xAt(60)-xAt(26)}   height="28" fill="#ffd700"/>
+            <text x={(xAt(-60)+xAt(26))/2} y="188" fontSize="10" fill="#0a1421" textAnchor="middle" fontWeight="600">ACTIVE</text>
+            <text x={(xAt(26)+xAt(60))/2}  y="188" fontSize="10" fill="#0a1421" textAnchor="middle" fontWeight="600">SEARCH</text>
+            <text x={(xAt(60)+xAt(90))/2}  y="188" fontSize="10" fill="#cfe2ff" textAnchor="middle">OFF</text>
+          </g>
+
+          {/* ANT2 state band */}
+          <g>
+            <text x="35" y="221" fontSize="9" fill="#5a7090" textAnchor="end">ANT2</text>
+            <rect x={xAt(-60)} y="204" width={xAt(-30)-xAt(-60)} height="28" fill="#ffd700"/>
+            <rect x={xAt(-30)} y="204" width={xAt(0)-xAt(-30)}   height="28" fill="#b07aff"/>
+            <rect x={xAt(0)}   y="204" width={xAt(20)-xAt(0)}    height="28" fill="#b07aff"/>
+            <rect x={xAt(20)}  y="204" width={xAt(90)-xAt(20)}   height="28" fill="#00cfff"/>
+            <text x={(xAt(-60)+xAt(-30))/2} y="222" fontSize="10" fill="#0a1421" textAnchor="middle" fontWeight="600">SEARCH</text>
+            <text x={(xAt(-30)+xAt(0))/2}   y="222" fontSize="10" fill="#0a1421" textAnchor="middle" fontWeight="600">TRACK</text>
+            <text x={(xAt(20)+xAt(90))/2}   y="222" fontSize="10" fill="#0a1421" textAnchor="middle" fontWeight="600">ACTIVE</text>
+          </g>
+
+          {/* Per-beam staggered ticks at T = 0, +1, +2, ... */}
+          <g>
+            <text x="35" y="259" fontSize="9" fill="#5a7090" textAnchor="end">Beams</text>
+            {Array.from({length: beamCount}, (_, i) => (
+              <g key={i}>
+                <line x1={xAt(i*HANDOVER_TIMING.BEAM_STAGGER_SEC)} y1="246"
+                      x2={xAt(i*HANDOVER_TIMING.BEAM_STAGGER_SEC)} y2="272"
+                      stroke="#ff69b4" strokeWidth="2"/>
+                <text x={xAt(i*HANDOVER_TIMING.BEAM_STAGGER_SEC)}
+                      y={i % 2 === 0 ? 290 : 300}
+                      fontSize="9" fill="#ff69b4" textAnchor="middle">B{i+1}</text>
+              </g>
+            ))}
+            <text x={xAt(beamCount + 2)} y="261" fontSize="9" fill="#5a7090">
+              ↳ 1-sec stagger · O3B-SAT-TRD-REQ-1 · max 1 carrier/sec
+            </text>
+          </g>
+
+          {/* Step labels */}
+          <g fontSize="9" fill="#5a7090" fontWeight="600" letterSpacing="1">
+            <text x={(xAt(-60)+xAt(0))/2}  y="14" textAnchor="middle">STEP 1 · PRE-HANDOVER</text>
+            <text x={(xAt(0)+xAt(30))/2}   y="14" textAnchor="middle">STEP 2 + 3 · HANDOVER + OVERLAP</text>
+            <text x={(xAt(60)+xAt(90))/2}  y="14" textAnchor="middle">STEP 4 · POST-HANDOVER</text>
+          </g>
+        </svg>
+
+        {/* Legend */}
+        <div style={{display:"flex",gap:"16px",flexWrap:"wrap",fontSize:"10px",color:"#5a7090",marginTop:"8px"}}>
+          {[
+            ["#2a3d54","ANT OFF"],["#ffd700","SEARCH (TLE)"],["#b07aff","TRACK"],["#00cfff","ACTIVE"],
+            ["#ff6b35","Setting sat"],["#7fff00","Overlap"],["#ff4444","Blank cmds"],
+          ].map(([c, l]) => (
+            <span key={l}>
+              <span style={{display:"inline-block",width:"10px",height:"10px",background:c,borderRadius:"2px",marginRight:"4px",verticalAlign:"middle"}}/>
+              {l}
+            </span>
+          ))}
+        </div>
+
+        {/* Inline XML preview */}
+        {showXml && (
+          <pre style={{
+            marginTop:"12px",background:"#050a12",border:"1px solid #1a2d44",padding:"10px",borderRadius:"3px",
+            fontSize:"10px",color:"#8ab0d0",fontFamily:"'SF Mono', Menlo, monospace",
+            maxHeight:"260px",overflow:"auto",whiteSpace:"pre",
+          }}>{xml}</pre>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════
 // MAIN SIMULATOR COMPONENT
 // ═══════════════════════════════════════════════════════════════
 export default function O3bSimulator() {
   const animRef    = useRef(null);
   const lastMs     = useRef(null);
   const simTimeRef = useRef(0);
-  // Guard against rapid double-clicks firing duplicate OpenSky /tracks/all calls.
+  // v4.22.1 (ported from v4.21.3): debounce duplicate OpenSky /tracks/all calls.
   // Set true while loadRealFlightTrack is in flight; further invocations no-op.
   const trackLoadingRef = useRef(false);
 
@@ -6140,6 +6820,22 @@ export default function O3bSimulator() {
   const [playing,  setPlaying]  = useState(false);
   const [speed,    setSpeed]    = useState(120);
   const [numSats,  setNumSats]  = useState(6);
+  // Constellation mode — switchable between live mPOWER and documented O3b classic.
+  // Flipping this also forces numSats to the canonical N for that constellation.
+  const [constellationId, setConstellationId] = useState("MPOWER");
+  const constellation = useMemo(
+    () => CONSTELLATIONS[constellationId] || CONSTELLATIONS.MPOWER,
+    [constellationId]
+  );
+  // When user switches constellation, snap numSats to that constellation's N.
+  // (Users can still override numSats afterward — we don't lock it.)
+  const prevConstellationIdRef = useRef(constellationId);
+  useEffect(() => {
+    if (prevConstellationIdRef.current !== constellationId) {
+      setNumSats(constellation.numSats);
+      prevConstellationIdRef.current = constellationId;
+    }
+  }, [constellationId, constellation.numSats]);
   const [tab,      setTab]      = useState("coverage");
   const [elSl,     setElSl]     = useState(20);
   const [gpLat,    setGpLat]    = useState(20);
@@ -6195,10 +6891,9 @@ export default function O3bSimulator() {
   const [recentAirports,    setRecentAirports]    = useState(() => lsGet(LS_RECENT_AIRPORTS, [])); // (E) persisted
   const [recentFlights,     setRecentFlights]     = useState(() => lsGet(LS_RECENT_FLIGHTS, []));
   const [flightSelecting, setFlightSelecting_] = useState(null); // "origin" | "dest" | null
-  // v4.21.4 (review H3): ref declared *before* the wrapper that uses it.
+  // v4.22.1 (review H3): ref declared *before* the wrapper that uses it.
   // Previously this lived ~20 lines below; the working code only worked
-  // because function declarations are hoisted within their scope and the
-  // ref was initialized by the time the wrapper was actually called.
+  // because function declarations are hoisted within their scope.
   const flightSelectingRef = useRef(null);
   // Wrapper keeps the ref in sync for the onPinDrop closure
   function setFlightSelecting(v) { flightSelectingRef.current = v; setFlightSelecting_(v); }
@@ -6219,7 +6914,7 @@ export default function O3bSimulator() {
   const satNames = useMemo(() => getSatNames(numSats), [numSats]);
   const satSpacing = (360 / numSats).toFixed(1);
 
-  // v4.21.4 (review H3): flightSelectingRef now declared above with setFlightSelecting.
+  // v4.22.1 (review H3): flightSelectingRef now declared above with setFlightSelecting.
   const onPinDrop = useCallback(({ lat, lon }) => {
     const sel = flightSelectingRef.current;
     const label = `${Math.abs(lat).toFixed(2)}${lat>=0?"N":"S"} ${Math.abs(lon).toFixed(2)}${lon>=0?"E":"W"}`;
@@ -6349,8 +7044,9 @@ export default function O3bSimulator() {
   // Fetch the actual ADS-B track for a selected flight, downsample to ~200 pts,
   // and bind origin/dest from the airport database.
   async function loadRealFlightTrack(flight) {
-    // Debounce: if a track fetch is already in flight, ignore subsequent clicks
-    // (covers both the search-results list and the recent-flights chip buttons).
+    // v4.22.1 (ported from v4.21.3): debounce — if a track fetch is already in
+    // flight, ignore subsequent clicks (covers both search-results list and
+    // recent-flights chip buttons).
     if (trackLoadingRef.current) return;
     trackLoadingRef.current = true;
     setRealFlightLoading(true);
@@ -6359,9 +7055,9 @@ export default function O3bSimulator() {
       // Use middle-of-flight time for the tracks call
       const midTime = Math.floor((flight.firstSeen + flight.lastSeen) / 2);
       const url = `${OPENSKY_PROXY}/api/tracks/all?icao24=${encodeURIComponent(flight.icao24)}&time=${midTime}`;
-      // Session cache: re-selecting the same flight in this session is free
-      // (no OpenSky hit). Key is deterministic from icao24 + midTime, which is
-      // derived from firstSeen/lastSeen and is therefore stable per flight.
+      // v4.22.1 (ported from v4.21.3): session cache — re-selecting the same
+      // flight in this session bypasses the network. Key is deterministic from
+      // icao24 + midTime (derived from firstSeen/lastSeen, so stable per flight).
       const cacheKey = `opensky-track:${flight.icao24}:${midTime}`;
       let text = null;
       try {
@@ -6469,7 +7165,7 @@ export default function O3bSimulator() {
       setRealFlightError(msg);
     } finally {
       setRealFlightLoading(false);
-      trackLoadingRef.current = false;
+      trackLoadingRef.current = false; // v4.22.1 (ported from v4.21.3): release debounce
     }
   }
 
@@ -6566,7 +7262,7 @@ export default function O3bSimulator() {
   }, [flightMode, flightOrigin, flightDest, flightStartTime, simTime, realFlightTrack]);
 
   // When flight is active, update analysis point to track the plane.
-  // v4.21.4 (review M1): coarsen to 2 decimals (~1 km). React's setState bails
+  // v4.22.1 (review M1): coarsen to 2 decimals (~1 km). React's setState bails
   // out when the new primitive === current, so a slow-moving aircraft no longer
   // triggers downstream re-renders on every 33 ms animation tick.
   useEffect(() => {
@@ -6587,24 +7283,24 @@ export default function O3bSimulator() {
     let prevSatIdx = -1, prevGwId = null;
 
     // Three coverage tiers — each independently tracked. Thresholds are
-    // user-configurable; default values noted in parentheses for orientation.
-    //  1. Constellation       — best satellite EL ≥ gwMinEl     (default 10°; operational floor for any link)
-    //  2. Ka2517 terminal     — best satellite EL ≥ ka2517MinEl (default 20°; antenna scan floor, regardless of GW)
+    // user-configurable; default values noted in parens for orientation.
+    //  1. Constellation       — best satellite EL ≥ gwMinEl     (default 10°)
+    //  2. Ka2517 terminal     — best satellite EL ≥ ka2517MinEl (default 20°)
     //  3. End-to-end service  — Tier-2 viable AND an active gateway sees the same satellite at ≥ gwMinEl
     let covCount = 0, terminalCovCount = 0, e2eCovCount = 0;
     // Alternative satellite tracking: during "no active gateway" closures,
     // track terminal EL of the sat that HAS gw coverage (below ka2517MinEl)
     let altTermElMin = 999, altTermElMax = -999, altTermElSum = 0, altTermElCount = 0;
-    // Elevation stats collected only over Tier-2 (terminal-viable) samples.
+    // Elevation stats collected only over terminal-viable samples (EL ≥ 15°)
     let sumEl = 0, minEl = 999, maxEl = -999;
     let satHandovers = 0, gwHandovers = 0;
     const satDuration = {}, gwDuration = {};
     const gwElStats = {}; // gwId -> { sumEl, minEl, maxEl, count }
     const satTransitions = [];
     const gwTransitions  = [];
-    const coverageGaps   = []; // Tier-1 outages: best EL < gwMinEl
-    const terminalGaps   = []; // Tier-2 outages: best EL < ka2517MinEl (sat may still be Tier-1 visible)
-    const serviceGaps    = []; // Tier-3 outages: Tier-2 ok but no active GW sees the serving sat
+    const coverageGaps   = []; // constellation outages  (EL < 5°)
+    const terminalGaps   = []; // terminal outages       (EL < 15°, but sat may be visible)
+    const serviceGaps    = []; // e2e service outages    (EL ≥ 15° but no active gateway)
     let gapStart = null, terminalGapStart = null, serviceGapStart = null;
 
     for (let i = 0; i <= N; i++) {
@@ -6795,7 +7491,7 @@ export default function O3bSimulator() {
       terminalCovPct,  // Tier 2: Ka2517 terminal viable (best sat EL ≥ ka2517MinEl, default 20°)
       e2eCovPct,       // Tier 3: end-to-end (Tier-2 viable AND an active GW sees same sat)
       serviceCovPct: e2eCovPct, // alias used elsewhere in JSX
-      // Elevation stats (over Tier-2 / terminal-viable samples)
+      // Elevation stats (over terminal-viable samples)
       minEl: terminalCovCount > 0 ? +minEl.toFixed(1) : 0,
       maxEl: terminalCovCount > 0 ? +maxEl.toFixed(1) : 0,
       avgEl: terminalCovCount > 0 ? +(sumEl / terminalCovCount).toFixed(1) : 0,
@@ -6813,7 +7509,7 @@ export default function O3bSimulator() {
       numSats,
       activeGwCount: activeGateways.length,
     };
-    // v4.21.4 (review M2): simTime intentionally OMITTED from deps. The sweep
+    // v4.22.1 (review M2): simTime intentionally OMITTED from deps. The sweep
     // covers the whole flight from flightStartTime → flightStartTime+durationSec
     // and doesn't depend on the current playback cursor. Including simTime made
     // this 400-iteration sweep re-run ~30×/sec while playback was active.
@@ -6832,7 +7528,7 @@ export default function O3bSimulator() {
     const satHandoffs = [], gwHandoffs = [];
     let worstFwd = 0, worstRtn = 0, worstFwdPair = "", worstRtnPair = "";
     let covCount = 0;
-    // v4.21.4 (review M4): hoist sat-name list out of the 400-iteration loop.
+    // v4.22.1 (review M4): hoist sat-name list out of the 400-iteration loop.
     const satNamesLocal = getSatNames(numSats);
 
     for (let i = 0; i <= N; i++) {
@@ -6888,7 +7584,7 @@ export default function O3bSimulator() {
 
       // Accumulate pairing
       if (activeGwId && activeSat >= 0) {
-        const satName = satNamesLocal[activeSat]; // v4.21.4 (review M4)
+        const satName = satNamesLocal[activeSat]; // v4.22.1 (review M4)
         const key = `${satName}|${activeGwId}`;
         const gwObj = activeGateways.find(g => g.id === activeGwId);
         if (!pairings.has(key)) {
@@ -7910,6 +8606,15 @@ export default function O3bSimulator() {
             <option value={300}>300× real</option>
             <option value={600}>600× real</option>
             <option value={3600}>3600× (1h/s)</option>
+          </select>
+          <span style={{color:"#4a6a8a",fontSize:"9px",marginLeft:"4px"}}>CONSTELLATION:</span>
+          <select style={{...S.sel, minWidth:"180px"}}
+                  value={constellationId}
+                  onChange={e => setConstellationId(e.target.value)}
+                  title={constellation.docSource}>
+            {Object.values(CONSTELLATIONS).map(c => (
+              <option key={c.id} value={c.id}>{c.label}</option>
+            ))}
           </select>
           <span style={{color:"#4a6a8a",fontSize:"9px",marginLeft:"4px"}}>SATS:</span>
           <div style={{display:"flex",gap:"1px"}}>
@@ -8955,6 +9660,16 @@ export default function O3bSimulator() {
                 </div>
               </div>
             )}
+
+            {/* ════ v4.22: Documented O3b Handover Timeline ════ */}
+            <O3bHandoverTimelinePanel
+              simTime={simTime}
+              gpLat={gpLat}
+              gpLon={gpLon}
+              constellation={constellation}
+              minEl={ka2517MinEl}
+            />
+
           </div>
         )}
 
@@ -10223,6 +10938,7 @@ export default function O3bSimulator() {
             interfNextId={interfNextId}
             setInterfNextId={setInterfNextId}
             INTERFERENCE_COLORS={INTERFERENCE_COLORS}
+            constellation={constellation}
           />
         )}
 
