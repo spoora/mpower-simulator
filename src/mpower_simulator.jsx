@@ -6,71 +6,9 @@ import {
 } from "recharts";
 
 // ═══════════════════════════════════════════════════════════════
-// REACT HOOK HELPERS
-// ═══════════════════════════════════════════════════════════════
-/**
- * useLatestRef — returns a ref that always reflects the latest value of `value`.
- * Used to bridge prop/state values into long-lived callbacks (draw loops, event
- * handlers) without re-creating the callback on every render. v4.22.1 (review M5/L8):
- * replaces the repeated `const r = useRef(v); useEffect(() => { r.current = v; }, [v])` pattern.
- * @template T
- * @param {T} value
- * @returns {{ current: T }}
- */
-function useLatestRef(value) {
-  const ref = useRef(value);
-  useEffect(() => { ref.current = value; }, [value]);
-  return ref;
-}
-
-/**
- * useQuantizedValue — snap `value` to multiples of `step` so a memo that depends
- * on this only recomputes when the bucket changes. v4.22.1 (review NEW-7):
- * coarsens simTime for the expensive handover-search memos (was recomputing 30x/sec).
- * @param {number} value
- * @param {number} step
- * @returns {number}
- */
-function useQuantizedValue(value, step) {
-  return useMemo(() => Math.floor(value / step) * step, [value, step]);
-}
-
-// ═══════════════════════════════════════════════════════════════
 // ORBITAL CONSTANTS — O3b mPOWER
 // ═══════════════════════════════════════════════════════════════
-// v4.22.1 — Claudina review-merge (25 May 2026): v4.22 + v4.21.4 fix set + new
-// handover-engine bug fixes. See mpower_simulator_code_review_v4.22.md for detail.
-//
-// Ported from v4.21.4 fix set (against v4.21.1 baseline):
-//   C1: Ka2517 efficiency grid symmetry  (asymmetric Southern Hemisphere rows)
-//   H1: Tier-coverage comments aligned with actual code
-//   H2: runStrategyComparison cancellation guard
-//   H3: flightSelectingRef declared before use
-//   M1: flightData→gp position precision coarsened (toFixed 3→2)
-//   M2: simTime removed from flightStats dep array
-//   M3: interfActiveLinks memoized
-//   M4: getSatNames hoisted out of resourceData hot loop
-//   M5/L8: useLatestRef helper; consolidated 11 ref-syncing useEffects in MapCanvas
-//   L1: Removed duplicate VOMM key in DEST_AIRPORT_NAMES
-//   L2: Atmospheric / rain / misc loss factored into named constants
-//   L3: C_LIGHT = 299792458 (was 3e8)
-//   L4: losGroundPoints uses module Re instead of inline 6371
-//   L5: CRUISE_ALT_KM intent documented (lower-bound, not typical cruise)
-//   L6: Removed dead 5-char ZSAAK key from AIRLINE_NAMES
-//   L7: Documented the 41.25° lat cutoff in ka2517EfficiencyLookup
-//
-// Ported from v4.21.3 (v4.22 had forked off v4.21.1 and missed these):
-//   loadRealFlightTrack debounce ref, sessionStorage cache, HTTP 429/5xx branches
-//
-// New v4.22 bug fixes (against v4.22 baseline):
-//   NEW-1: fmtScheduleTime anchors sim t=0 to module-load wall-clock (was 1970 epoch)
-//   NEW-2: passDurationSec derived from w_rel (was magic constant *60 that only fit mPOWER altitude)
-//   NEW-3: O3bHandoverTimelinePanel "Copy" timer has cleanup ref
-//   NEW-4: ANT2 SEARCH→TRACK transition uses named constant (was hardcoded -30)
-//   NEW-5: Overlap-window cap uses named OVERLAP_GRACE_SEC (was hardcoded +4)
-//   NEW-7: findNextHandover memo coarsened to 5-sec simTime buckets (was 30/sec)
-//   NEW-8: buildScheduleXML uses `?? 10` not `|| 10` (so explicit minEl=0 works)
-const VERSION = "v4.22.1 (O3b Handover Realism Pack + review-merge)";
+const VERSION = "v4.23 (O3b Handover Realism Pack + BBM Aero Conops)";
 const Re     = 6371;
 const h_orb  = 8063;
 const Rs     = Re + h_orb;
@@ -120,10 +58,8 @@ const CONSTELLATIONS = {
 // ═══════════════════════════════════════════════════════════════
 const HANDOVER_TIMING = {
   PRE_HANDOVER_SEC:      60,    // T=-60s: ANT2 begins tracking rising sat via TLE
-  ANT2_TRACK_TRANSITION_SEC: 30, // v4.22.1 (review NEW-4): ANT2 transitions SEARCH→TRACK at T=-30s (half of PRE_HANDOVER)
   OVERLAP_TARGET_SEC:    30,    // T=0 to +30s: target data overlap window
   OVERLAP_MIN_SEC:       26,    // T=+26s: setting sat first blank-on CMD
-  OVERLAP_GRACE_SEC:     4,     // v4.22.1 (review NEW-5): amps-blank grace before full cut (caps effective overlap at OVERLAP_MIN_SEC + this)
   HANDOVER_DEADLINE_SEC: 25,    // Vendor must complete handover within 25 s
   MODEM_LOCK_SEC:        20,    // T=+20s: demod-B locked to rising sat
   ANT1_RELEASE_SEC:      60,    // T=+60s: ANT1 RF paths removed by scheduler
@@ -147,6 +83,178 @@ const HANDOVER_PHASE = {
   OVERLAP: "OVERLAP",  // T = 0 to +30s (make-before-break)
   POST:    "POST",     // T = +30s to +60s (ANT1 release)
 };
+
+// ═══════════════════════════════════════════════════════════════
+// BBM (Break-Before-Make) ConOps Module
+//
+// Adds a single-receiver aero terminal class (AERO_BBM_SINGLE_RX) plus
+// the handover engine, reclaimed-capacity accounting, and conops-aware
+// dispatcher required to model aero handovers correctly.
+//
+// All constants traceable to O3B-SYS-ENG-000xx Handover Timeline rev 3
+// or HANDOVER_TIMING above. Engineering estimates are flagged inline.
+// ═══════════════════════════════════════════════════════════════
+
+/** @typedef {"MBB_DUAL_ANT" | "AERO_BBM_SINGLE_RX"} TerminalClass */
+
+/** @type {Readonly<{MBB_DUAL_ANT: TerminalClass, AERO_BBM_SINGLE_RX: TerminalClass}>} */
+const TERMINAL_CLASS = Object.freeze({
+  MBB_DUAL_ANT:       "MBB_DUAL_ANT",        // dual-antenna terminals (maritime, gov, fixed)
+  AERO_BBM_SINGLE_RX: "AERO_BBM_SINGLE_RX",  // single-modem aero terminals
+});
+
+const BBM_HANDOVER_TIMING = Object.freeze({
+  ACQUISITION_GAP_COLD_SEC:        20,   // matches HANDOVER_TIMING.MODEM_LOCK_SEC
+  ACQUISITION_GAP_WARM_TARGET_SEC: 5,    // engineering target — vendor RFC required
+  RECLAIMED_DUAL_CARRIER_SEC:      60,   // derived: 30s setting + 30s rising overlap
+  PRE_HANDOVER_PRELOAD_SEC:        60,   // matches HANDOVER_TIMING.PRE_HANDOVER_SEC
+  BEAM_STAGGER_SEC:                1.0,  // O3B-SAT-TRD-REQ-1 still applies
+});
+
+/** @typedef {"STEADY"|"PRE"|"OUTAGE"|"REACQ"|"POST"} HandoverPhaseBBM */
+
+const BBM_HANDOVER_PHASE = Object.freeze({
+  STEADY: "STEADY",
+  PRE:    "PRE",
+  OUTAGE: "OUTAGE",
+  REACQ:  "REACQ",
+  POST:   "POST",
+});
+
+/**
+ * BBM-mode handover state — single-modem state machine for aero terminals.
+ * @param {number} t                   sim time (s)
+ * @param {object|null} hoEvent        from findNextHandover()
+ * @param {object} constellation       CONSTELLATIONS entry
+ * @param {number[]|null} beamIds      beam IDs for this terminal
+ * @param {{warmStart?: boolean}} [opts]
+ * @returns {object} BBM state — see comments
+ */
+function getHandoverState_BBM(t, hoEvent, constellation, beamIds, opts) {
+  const warmStart = !opts || opts.warmStart !== false;
+  const acquisitionGap = warmStart
+    ? BBM_HANDOVER_TIMING.ACQUISITION_GAP_WARM_TARGET_SEC
+    : BBM_HANDOVER_TIMING.ACQUISITION_GAP_COLD_SEC;
+
+  if (!hoEvent) {
+    return {
+      phase: BBM_HANDOVER_PHASE.STEADY,
+      phaseT: 0,
+      modem: null,
+      beams: [],
+      terminalInOutage: false,
+      outageStartT: 0,
+      outageEndT: 0,
+      acquisitionGap,
+    };
+  }
+
+  const dt = t - hoEvent.t0;
+  const outageStartT = hoEvent.t0;
+  const outageEndT = hoEvent.t0 + acquisitionGap;
+
+  let phase, modemStatus, modemSat, modemEl;
+  if (dt < -BBM_HANDOVER_TIMING.PRE_HANDOVER_PRELOAD_SEC) {
+    phase = BBM_HANDOVER_PHASE.STEADY;
+    modemStatus = "ACTIVE"; modemSat = hoEvent.currentSat; modemEl = hoEvent.currentEl;
+  } else if (dt < 0) {
+    phase = BBM_HANDOVER_PHASE.PRE;
+    modemStatus = "ACTIVE"; modemSat = hoEvent.currentSat; modemEl = hoEvent.currentEl;
+  } else if (dt < acquisitionGap) {
+    phase = BBM_HANDOVER_PHASE.OUTAGE;
+    modemStatus = "SEARCH"; modemSat = hoEvent.nextSat; modemEl = hoEvent.nextEl;
+  } else if (dt < BBM_HANDOVER_TIMING.RECLAIMED_DUAL_CARRIER_SEC / 2) {
+    phase = BBM_HANDOVER_PHASE.REACQ;
+    modemStatus = "ACTIVE"; modemSat = hoEvent.nextSat; modemEl = hoEvent.nextEl;
+  } else {
+    phase = BBM_HANDOVER_PHASE.STEADY;
+    modemStatus = "ACTIVE"; modemSat = hoEvent.nextSat; modemEl = hoEvent.nextEl;
+  }
+
+  const beams = (beamIds && beamIds.length ? beamIds : [1]).map((bid, i) => {
+    const hoT = hoEvent.t0 + i * BBM_HANDOVER_TIMING.BEAM_STAGGER_SEC;
+    const lockT = hoT + acquisitionGap;
+    return {
+      id: bid,
+      handoverT: hoT,
+      modemLockT: lockT,
+      activeSat: (t >= lockT) ? hoEvent.nextSat : hoEvent.currentSat,
+      inOutage: (t >= hoT && t < lockT),
+    };
+  });
+
+  return {
+    phase,
+    phaseT: dt,
+    modem: { sat: modemSat, status: modemStatus, el: modemEl },
+    beams,
+    terminalInOutage: phase === BBM_HANDOVER_PHASE.OUTAGE,
+    outageStartT,
+    outageEndT,
+    acquisitionGap,
+  };
+}
+
+/**
+ * Reclaimed dual-carrier presence per handover event under BBM.
+ * @param {object|null} hoEvent
+ * @param {boolean} isAeroDedicated
+ * @returns {{settingSatSec:number, risingSatSec:number, totalCarrierSec:number, dedicatedAero:boolean, explanation:string}}
+ */
+function computeReclaimedCarrierSec(hoEvent, isAeroDedicated) {
+  if (!hoEvent) {
+    return { settingSatSec: 0, risingSatSec: 0, totalCarrierSec: 0,
+             dedicatedAero: false, explanation: "no handover event" };
+  }
+  if (!isAeroDedicated) {
+    return { settingSatSec: 0, risingSatSec: 0, totalCarrierSec: 0,
+             dedicatedAero: false,
+             explanation: "beam shares MBB-required terminals; overlap still needed" };
+  }
+  return {
+    settingSatSec: 30, risingSatSec: 30,
+    totalCarrierSec: BBM_HANDOVER_TIMING.RECLAIMED_DUAL_CARRIER_SEC,
+    dedicatedAero: true,
+    explanation: "aero-dedicated carrier; full dual-carrier overlap reclaimed",
+  };
+}
+
+/**
+ * Roll-up reclaimed capacity across a beam-day at constellation scale.
+ * @param {object} constellation
+ * @param {number} aeroBeamsCount
+ * @returns {{handoversPerBeamDay:number, carrierSecPerDay:number, carrierEquivalents:number, pctOfActiveBeams:number}}
+ */
+function rollupReclaimedCapacity(constellation, aeroBeamsCount) {
+  const handoversPerBeamDay = (24 * 60) / (360 / constellation.numSats);
+  const carrierSecPerDay = aeroBeamsCount * handoversPerBeamDay *
+                           BBM_HANDOVER_TIMING.RECLAIMED_DUAL_CARRIER_SEC;
+  const carrierEquivalents = carrierSecPerDay / 86400;
+  const activeBeams = constellation.numSats * 2 * constellation.beamsPerSubRegion;
+  return {
+    handoversPerBeamDay, carrierSecPerDay, carrierEquivalents,
+    pctOfActiveBeams: activeBeams > 0 ? (aeroBeamsCount / activeBeams) * 100 : 0,
+  };
+}
+
+/**
+ * ConOps-aware dispatcher. Routes to MBB or BBM engine based on terminal class.
+ * @param {{terminalClass?: TerminalClass}} terminal
+ * @param {number} t
+ * @param {object|null} hoEvent
+ * @param {object} constellation
+ * @param {number[]|null} beamIds
+ * @param {{warmStart?: boolean}} [opts]
+ */
+function getHandoverState_ConOpsAware(terminal, t, hoEvent, constellation, beamIds, opts) {
+  const cls = (terminal && terminal.terminalClass) || TERMINAL_CLASS.MBB_DUAL_ANT;
+  if (cls === TERMINAL_CLASS.AERO_BBM_SINGLE_RX) {
+    return { conops: "BBM",
+             ...getHandoverState_BBM(t, hoEvent, constellation, beamIds, opts) };
+  }
+  return { conops: "MBB",
+           ...getHandoverState(t, hoEvent, constellation, beamIds) };
+}
 
 // Dynamic constellation helpers
 function getInitLons(n) { return Array.from({length:n},(_,i)=>wrapL(i*360/n)); }
@@ -637,8 +745,7 @@ function getHandoverState(t, hoEvent, constellation, beamIds) {
   } else if (dt < 0) {
     phase = HANDOVER_PHASE.PRE;
     ant1Status = ANT_STATE.ACTIVE;
-    // v4.22.1 (review NEW-4): was hardcoded -30. Use named constant.
-    ant2Status = (dt < -HANDOVER_TIMING.ANT2_TRACK_TRANSITION_SEC) ? ANT_STATE.SEARCH : ANT_STATE.TRACK;
+    ant2Status = (dt < -30) ? ANT_STATE.SEARCH : ANT_STATE.TRACK;
   } else if (dt < HANDOVER_TIMING.OVERLAP_MIN_SEC) {
     phase = HANDOVER_PHASE.OVERLAP;
     ant1Status = ANT_STATE.ACTIVE; ant2Status = ANT_STATE.ACTIVE;
@@ -674,8 +781,7 @@ function computeOverlapWindow(hoEvent, lat, lon, constellation, minEl) {
     settingEnd = dt;
   }
   // Per doc: setting sat amps blank at T=+26s regardless, so effective overlap caps there
-  // v4.22.1 (review NEW-5): was hardcoded "+4" — now uses OVERLAP_GRACE_SEC.
-  const effective = Math.min(settingEnd, HANDOVER_TIMING.OVERLAP_MIN_SEC + HANDOVER_TIMING.OVERLAP_GRACE_SEC);
+  const effective = Math.min(settingEnd, HANDOVER_TIMING.OVERLAP_MIN_SEC + 4);
   return {
     durationSec: effective,
     compliant: effective >= HANDOVER_TIMING.MIN_OVERLAP_PLAN_SEC,
@@ -683,25 +789,11 @@ function computeOverlapWindow(hoEvent, lat, lon, constellation, minEl) {
 }
 
 /**
- * Format a sim-time timestamp as the SDB Schedule File time format:
- * mm/dd/yyyy hh:mm:ss.fff (UTC).
- *
- * v4.22.1 (review NEW-1): simTime in this simulator is "seconds since module
- * load", NOT Unix epoch — so `new Date(simTime * 1000)` produced 1970-relative
- * timestamps in the exported XML, useless for real SDB integration. We now
- * anchor sim t=0 to the moment the module loaded, so the XML reflects wall-clock
- * UTC. Pass `epochOriginMs` to override (e.g. if the user has a different
- * scenario start time).
- *
- * @param {number} simTimeSec       seconds since module load
- * @param {number} [epochOriginMs]  ms-epoch corresponding to simTime = 0
- *                                  (defaults to module-load wall-clock)
- * @returns {string}
+ * Format a sim-time timestamp (seconds since epoch) as the SDB Schedule File
+ * time format: mm/dd/yyyy hh:mm:ss.fff (UTC).
  */
-const SIM_EPOCH_ORIGIN_MS = typeof Date !== "undefined" ? Date.now() : 0;
-function fmtScheduleTime(simTimeSec, epochOriginMs) {
-  const originMs = epochOriginMs == null ? SIM_EPOCH_ORIGIN_MS : epochOriginMs;
-  const d = new Date(originMs + simTimeSec * 1000);
+function fmtScheduleTime(simTimeSec) {
+  const d = new Date(simTimeSec * 1000);
   const pad = (n, w) => String(n).padStart(w || 2, "0");
   return `${pad(d.getUTCMonth()+1)}/${pad(d.getUTCDate())}/${d.getUTCFullYear()} ` +
          `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}.000`;
@@ -725,8 +817,7 @@ function buildScheduleXML(terminal, constellation, simTime, durationSec, beamIds
   const endT = simTime + durationSec;
   let safety = 0;
   while (t < endT && safety < 24) {
-    // v4.22.1 (review NEW-8): nullish-coalesce so an explicit minEl=0 isn't overridden.
-    const ho = findNextHandover(terminal.lat, terminal.lon, t, constellation, terminal.minEl ?? 10);
+    const ho = findNextHandover(terminal.lat, terminal.lon, t, constellation, terminal.minEl || 10);
     if (!ho) break;
     if (ho.t0 > endT) break;
     events.push(ho);
@@ -734,11 +825,7 @@ function buildScheduleXML(terminal, constellation, simTime, durationSec, beamIds
     safety++;
   }
   const N = constellation.numSats;
-  // v4.22.1 (review NEW-2): was `(360 / N) * 60` — the "60" magic constant only
-  // matched mPOWER's altitude by coincidence (1 / toDeg(w_rel) ≈ 60 sec/°).
-  // Derive directly from w_rel so this scales correctly if h_orb changes.
-  // Time to traverse 360/N degrees of ground-relative motion (sec).
-  const passDurationSec = (360 / N) / toDeg(w_rel);
+  const passDurationSec = (360 / N) * 60;  // ≈ 45 min for N=8, 32.7 min for N=11 (at orbital rate)
   const satName = (idx) => {
     if (constellation.nameFormat === "padded") {
       return `${constellation.namePrefix}${String(idx + 1).padStart(3, "0")}`;
@@ -908,7 +995,7 @@ const AIRLINE_NAMES = {
   SYR:"Syrianair",TAM:"LATAM Brasil",TAP:"TAP Portugal",THA:"Thai Airways",THY:"Turkish",
   TRA:"Transavia",TVF:"Transavia France",UAE:"Emirates",UAL:"United",UBT:"Tui Belgium",
   UCA:"Commutair",UPS:"UPS",VIR:"Virgin Atlantic",VOI:"Volaris",VRD:"Virgin America",
-  VLG:"Vueling",WJA:"WestJet",WUP:"Western Global",XAX:"AirAsia X", // v4.22.1 (review L6): removed dead ZSAAK key (5-char, never matches 3-char prefix)
+  VLG:"Vueling",WJA:"WestJet",WUP:"Western Global",XAX:"AirAsia X",ZSAAK:"South African",
 };
 
 // Friendly name for any airport ICAO code (just for displaying in result list).
@@ -988,7 +1075,7 @@ const DEST_AIRPORT_NAMES = {
   // Asia
   VIDP:"Delhi",VABB:"Mumbai",VOMM:"Chennai",VOBL:"Bangalore",VOHS:"Hyderabad",
   VOCI:"Kochi",VOCB:"Coimbatore",VOTV:"Trivandrum",VECC:"Kolkata",VAAH:"Ahmedabad",
-  VOGO:"Goa",VOTR:"Tiruchirappalli",VEBN:"Varanasi",VEPT:"Patna", // v4.22.1 (review L1): removed duplicate VOMM ("Madras" — same as Chennai above)
+  VOGO:"Goa",VOMM:"Madras",VOTR:"Tiruchirappalli",VEBN:"Varanasi",VEPT:"Patna",
   VAJJ:"Pune",VANP:"Nagpur",
   VHHH:"Hong Kong",VMMC:"Macau",ZBAA:"Beijing Capital",ZBAD:"Beijing Daxing",ZSPD:"Shanghai Pudong",
   ZSSS:"Shanghai Hongqiao",ZGGG:"Guangzhou",ZGSZ:"Shenzhen",ZUUU:"Chengdu",ZSHC:"Hangzhou",
@@ -1132,10 +1219,10 @@ function losGroundPoints(gwLat, gwLon, satLon, elDeg, n=20) {
   const az   = azimToSubSat(gwLat, gwLon, satLon);
   const elR  = toRad(Math.max(elDeg, 5));
   const maxKm = Math.min(12 / Math.tan(elR), 50); // troposphere crossing distance
-  // v4.22.1 (review L4): use module-level Re instead of redeclaring a local R.
+  const R = 6371;
   return Array.from({length:n}, (_,i) => {
     const d  = (i/(n-1)) * maxKm;
-    const dr = d / Re;
+    const dr = d / R;
     const la1 = toRad(gwLat), az1 = toRad(az);
     const lat2 = Math.asin(Math.sin(la1)*Math.cos(dr) + Math.cos(la1)*Math.sin(dr)*Math.cos(az1));
     const lon2 = toRad(gwLon) + Math.atan2(Math.sin(az1)*Math.sin(dr)*Math.cos(la1),
@@ -3022,22 +3109,16 @@ function GatewayWeatherTab({ simTime, numSats, satNames }) {
 }
 // ═══════════════════════════════════════════════════════════════
 const F_DL     = 19.95e9;
-const C_LIGHT  = 299792458; // v4.22.1 (review L3): was 3e8 (introduced ~0.07% FSPL error)
+const C_LIGHT  = 3e8;
 const EIRP_DBW = 68;
 const GT_DB    = 14.5;
 const BW_MHZ   = 216;
 const K_DB     = -228.6;
-// v4.22.1 (review L2): atmospheric / margin loss breakdown used by both legacy
-// linkBudget and aviation linkBudgetFL/RL. Kept as named constants so the two
-// budgets stay aligned (previously legacy used 0.5 dB atm vs aviation 0.3 dB).
-const ATM_LOSS_LEGACY_DB = 0.5; // legacy (fixed terminal) atmospheric loss
-const RAIN_LOSS_DB       = 2.5; // clear-sky rain allowance
-const MISC_LOSS_DB       = 1.0; // implementation / pointing / other
 
 function linkBudget(elDeg) {
   const d_m  = slantRange(elDeg) * 1000;
   const FSPL = 20 * Math.log10(4 * Math.PI * d_m * F_DL / C_LIGHT);
-  const loss = FSPL + ATM_LOSS_LEGACY_DB + RAIN_LOSS_DB + MISC_LOSS_DB; // v4.22.1 (review L2)
+  const loss = FSPL + 0.5 + 2.5 + 1.0;
   const C_No = EIRP_DBW - loss + GT_DB - K_DB;
   const C_N  = C_No - 10 * Math.log10(BW_MHZ * 1e6);
   const cap  = BW_MHZ * Math.log2(1 + Math.pow(10, C_N / 10));
@@ -3054,12 +3135,7 @@ function linkBudget(elDeg) {
 // ═══════════════════════════════════════════════════════════════
 // MODULE B — ThinKom Ka2517 ANTENNA MODEL
 // ═══════════════════════════════════════════════════════════════
-// v4.22.1 (review L5): renamed from CRUISE_ALT_KM. 3.048 km = 10,000 ft is a
-// conservative LOWER-BOUND aircraft altitude used for slantRangeAviation. Real
-// commercial Ka-band cruise is FL350–FL410 (~10.7–12.5 km), but at MEO range
-// the slant-range difference is <0.05% FSPL (negligible), so we hold the floor.
-const AIRCRAFT_ALT_FLOOR_KM = 3.048;
-const CRUISE_ALT_KM = AIRCRAFT_ALT_FLOOR_KM; // back-compat alias for existing references
+const CRUISE_ALT_KM  = 3.048;   // 10,000 ft fixed
 const ATM_LOSS_FL_DB = 0.3;     // Clear-sky FL atmospheric loss
 const ATM_LOSS_RL_DB = 0.3;     // Clear-sky RL atmospheric loss
 const MIN_SERVICE_EL_DEFAULT = 20.0; // Ka2517 minimum elevation default (user-configurable)
@@ -3143,7 +3219,7 @@ function linkBudgetFL(elDeg, useKa2517=false) {
   const d_m = (useKa2517 ? slantRangeAviation(elDeg) : slantRange(elDeg)) * 1000;
   const FSPL = 20 * Math.log10(4 * Math.PI * d_m * F_DL / C_LIGHT);
   const gt = useKa2517 ? ka2517GT(elDeg) : GT_DB;
-  const loss = FSPL + ATM_LOSS_FL_DB + RAIN_LOSS_DB + MISC_LOSS_DB; // v4.22.1 (review L2): named constants
+  const loss = FSPL + ATM_LOSS_FL_DB + 2.5 + 1.0; // atm + rain(0) + misc
   const C_No = EIRP_DBW - loss + gt - K_DB;
   const C_N  = C_No - 10 * Math.log10(BW_MHZ * 1e6);
   const modcod = dvbS2xModcod(C_N);
@@ -3154,7 +3230,7 @@ function linkBudgetRL(elDeg, useKa2517=false, satGtDbk=12.0) {
   const d_m = (useKa2517 ? slantRangeAviation(elDeg) : slantRange(elDeg)) * 1000;
   const FSPL = 20 * Math.log10(4 * Math.PI * d_m * F_UL / C_LIGHT);
   const eirp = useKa2517 ? ka2517TxEirp(elDeg) : 55.5;
-  const loss = FSPL + ATM_LOSS_RL_DB + MISC_LOSS_DB; // v4.22.1 (review L2): named constants (RL has no rain term)
+  const loss = FSPL + ATM_LOSS_RL_DB + 1.0;
   const C_No = eirp - loss + satGtDbk - K_DB;
   const C_N  = C_No - 10 * Math.log10(BW_MHZ * 1e6);
   const modcod = dvbS2xModcod(C_N);
@@ -3193,8 +3269,8 @@ const KA2517_EFFICIENCY_GRID = [
   { lat:  0.0, elEdge: 40.3, elCenter: 90.0, effEdgeFwd:1.250, effEdgeRtn:1.540, effCenterFwd:1.500, effCenterRtn:2.000 },
   { lat: -2.5, elEdge: 39.4, elCenter: 85.7, effEdgeFwd:1.209, effEdgeRtn:1.524, effCenterFwd:1.444, effCenterRtn:1.991 },
   { lat: -5.0, elEdge: 38.4, elCenter: 81.4, effEdgeFwd:1.167, effEdgeRtn:1.508, effCenterFwd:1.387, effCenterRtn:1.982 },
-  { lat: -7.5, elEdge: 37.5, elCenter: 77.1, effEdgeFwd:1.126, effEdgeRtn:1.491, effCenterFwd:1.331, effCenterRtn:1.974 }, // v4.22.1: was 1.167 (asymmetry bug, see review C1)
-  { lat:-10.0, elEdge: 36.5, elCenter: 72.8, effEdgeFwd:1.085, effEdgeRtn:1.475, effCenterFwd:1.275, effCenterRtn:1.965 }, // v4.22.1: was 1.167 (asymmetry bug, see review C1)
+  { lat: -7.5, elEdge: 37.5, elCenter: 77.1, effEdgeFwd:1.167, effEdgeRtn:1.491, effCenterFwd:1.331, effCenterRtn:1.974 },
+  { lat:-10.0, elEdge: 36.5, elCenter: 72.8, effEdgeFwd:1.167, effEdgeRtn:1.475, effCenterFwd:1.275, effCenterRtn:1.965 },
   { lat:-12.5, elEdge: 35.5, elCenter: 68.6, effEdgeFwd:1.085, effEdgeRtn:1.459, effCenterFwd:1.234, effCenterRtn:1.924 },
   { lat:-15.0, elEdge: 34.6, elCenter: 64.3, effEdgeFwd:1.002, effEdgeRtn:1.442, effCenterFwd:1.192, effCenterRtn:1.883 },
   { lat:-17.5, elEdge: 33.6, elCenter: 60.0, effEdgeFwd:0.961, effEdgeRtn:1.426, effCenterFwd:1.151, effCenterRtn:1.841 },
@@ -3211,8 +3287,6 @@ const KA2517_EFFICIENCY_GRID = [
 
 // Snap to nearest lat row; returns the entry or null if outside grid range.
 function ka2517EfficiencyLookup(latDeg) {
-  // v4.22.1 (review L7): 41.25 = grid endpoint (±40°) + half a grid step (1.25°).
-  // Ensures lat=40.0 snaps to the boundary row instead of returning null.
   if (Math.abs(latDeg) > 41.25) return null;
   let best = null, bestDist = Infinity;
   for (const r of KA2517_EFFICIENCY_GRID) {
@@ -3649,12 +3723,6 @@ function InterferenceTab({
   const [stratMinEl, setStratMinEl] = useState(5); // service threshold for strategy comparison; lower than ka2517MinEl by design
   const [stratResults, setStratResults] = useState(null);
   const [stratRunning, setStratRunning] = useState(false);
-  // v4.22.1 (review H2): track the deferred setTimeout so a rapid second click
-  // (or an unmount) cancels the in-flight run before its setState writes land.
-  const stratTimeoutRef = useRef(null);
-  useEffect(() => () => {
-    if (stratTimeoutRef.current) clearTimeout(stratTimeoutRef.current);
-  }, []);
 
   // ── Strategy playback state ──
   // After RUN, three small canvas maps below the cards play through the simulation.
@@ -3694,9 +3762,7 @@ function InterferenceTab({
   }, []);
 
   // ─── 1. Compute per-terminal active link (best sat + best GW) ──
-  // v4.22.1 (review M3): memoized — was a plain .map() that re-ran on every
-  // simTime tick (~30/sec during playback) regardless of whether inputs changed.
-  const interfActiveLinks = useMemo(() => interfTerminals.map(term => {
+  const interfActiveLinks = interfTerminals.map(term => {
     let bestSat = null, bestSatEl = -90;
     for (let i = 0; i < numSats; i++) {
       const sLon = satLon(i, simTime, numSats);
@@ -3712,7 +3778,7 @@ function InterferenceTab({
     }
     const viable = bestSat && bestSat.el >= ka2517MinEl && bestGw;
     return { term, sat: bestSat, gw: bestGw, viable };
-  }), [interfTerminals, simTime, numSats, activeGateways, gwMinEl, ka2517MinEl]);
+  });
 
   // ─── 2. Helper: angular sep at satellite between two terminals ──
   const angSepAtSat = (satLonDeg, ptA, ptB) => {
@@ -3834,12 +3900,9 @@ function InterferenceTab({
   //
   // Returns null until user presses "RUN COMPARISON".
   const runStrategyComparison = useCallback(() => {
-    // v4.22.1 (review H2): cancel any previously-scheduled run before starting a new one.
-    if (stratTimeoutRef.current) clearTimeout(stratTimeoutRef.current);
     setStratRunning(true);
     // Defer to next tick so the UI shows a "running" state
-    stratTimeoutRef.current = setTimeout(() => {
-      stratTimeoutRef.current = null;
+    setTimeout(() => {
       const STEP_SEC = 60;                          // 1-minute resolution
       const N_STEPS  = Math.max(2, Math.floor(stratWindowMin));
       const SAT_HYS  = 2;                           // deg, matches existing convention
@@ -5665,6 +5728,9 @@ function MapCanvas({ simTime, pins, onPinDrop, gpLat, gpLon, numSats, showGwLink
   const wrapRef      = useRef(null);
   const worldRef     = useRef(null);
   const transformRef = useRef(d3.zoomIdentity);
+  const simTimeRef   = useRef(simTime);
+  const pinsRef      = useRef(pins);
+  const gpRef        = useRef({ lat: gpLat, lon: gpLon });
   const dragStart    = useRef(null);
   const zoomBehav    = useRef(null);
   const projRef      = useRef(null);   // stores current projection for hit-testing
@@ -5676,23 +5742,28 @@ function MapCanvas({ simTime, pins, onPinDrop, gpLat, gpLon, numSats, showGwLink
   const [pinMode, setPinMode] = useState(false);
   const [dotTip,  setDotTip]  = useState(null);  // hovered flight-path dot tooltip
   const pinModeRef = useRef(false);
-  const prevSatIdxRef = useRef(-1);  // hysteresis: last active satellite index
+  const numSatsRef = useRef(numSats);
+  const showGwLinkRef = useRef(showGwLink);
+  const flightDataRef   = useRef(flightData);
+  const pathMarkersRef  = useRef(pathMarkers);
+  const activeGatewaysRef = useRef(activeGateways);
+  const prevSatIdxRef       = useRef(-1);  // hysteresis: last active satellite index
+  const gwMinElRef           = useRef(gwMinEl);  // keep draw callback in sync with prop
+  const flightSelectingRef_  = useRef(flightSelecting); // keep click handler in sync with prop
+  const pendingOriginRef     = useRef(pendingOrigin);
+  const pendingDestRef       = useRef(pendingDest);
 
-  // v4.22.1 (review M5/L8): consolidated 11 ref-syncing useEffects into useLatestRef calls.
-  // Each ref always reflects the latest prop value; consumers (draw, handlers) read .current.
-  const simTimeRef        = useLatestRef(simTime);
-  const pinsRef           = useLatestRef(pins);
-  const gpRef             = useLatestRef({ lat: gpLat, lon: gpLon });
-  const numSatsRef        = useLatestRef(numSats);
-  const showGwLinkRef     = useLatestRef(showGwLink);
-  const flightDataRef     = useLatestRef(flightData);
-  const pathMarkersRef    = useLatestRef(pathMarkers);
-  const activeGatewaysRef = useLatestRef(activeGateways);
-  const gwMinElRef        = useLatestRef(gwMinEl);
-  const flightSelectingRef_ = useLatestRef(flightSelecting);
-  // The pendingOrigin/pendingDest refs also need to trigger a redraw — keep them explicit.
-  const pendingOriginRef  = useRef(pendingOrigin);
-  const pendingDestRef    = useRef(pendingDest);
+  // Keep refs in sync so draw callback always has latest values
+  useEffect(() => { simTimeRef.current = simTime; }, [simTime]);
+  useEffect(() => { pinsRef.current = pins; }, [pins]);
+  useEffect(() => { gpRef.current = { lat: gpLat, lon: gpLon }; }, [gpLat, gpLon]);
+  useEffect(() => { numSatsRef.current = numSats; }, [numSats]);
+  useEffect(() => { showGwLinkRef.current = showGwLink; }, [showGwLink]);
+  useEffect(() => { flightDataRef.current    = flightData;     }, [flightData]);
+  useEffect(() => { pathMarkersRef.current   = pathMarkers;    }, [pathMarkers]);
+  useEffect(() => { activeGatewaysRef.current = activeGateways; }, [activeGateways]);
+  useEffect(() => { gwMinElRef.current = gwMinEl; }, [gwMinEl]);
+  useEffect(() => { flightSelectingRef_.current = flightSelecting; }, [flightSelecting]);
   useEffect(() => { pendingOriginRef.current = pendingOrigin; if (ready) draw(); }, [pendingOrigin, ready]);
   useEffect(() => { pendingDestRef.current   = pendingDest;   if (ready) draw(); }, [pendingDest,   ready]);
 
@@ -6489,59 +6560,60 @@ function MapCanvas({ simTime, pins, onPinDrop, gpLat, gpLon, numSats, showGwLink
 // SVG timeline strip with ANT1/ANT2 state bands, overlap window,
 // 1-sec staggered beam ticks, and an SDB Schedule File export.
 // ═══════════════════════════════════════════════════════════════
-function O3bHandoverTimelinePanel({ simTime, gpLat, gpLon, constellation, minEl }) {
+function O3bHandoverTimelinePanel({
+  simTime, gpLat, gpLon, constellation, minEl,
+  conopsMode, warmStart, aeroBeamsCount,
+}) {
   const [copied, setCopied] = useState(false);
   const [showXml, setShowXml] = useState(false);
-  // v4.22.1 (review NEW-3): track the "copied → false" reset timer so a rapid
-  // second click or unmount doesn't fire setCopied on an unmounted component.
-  const copiedTimeoutRef = useRef(null);
-  useEffect(() => () => {
-    if (copiedTimeoutRef.current) clearTimeout(copiedTimeoutRef.current);
-  }, []);
-
-  // v4.22.1 (review NEW-7): coarsen simTime to 5-second buckets for the heavy
-  // handover-search memos. findNextHandover does ~360 sample-points × N sats of
-  // elevation calcs; recomputing 30×/sec during playback was burning ~120k trig
-  // calls/sec. Updating the panel every 5 sim-sec is plenty for a chart that
-  // shows minutes-to-next-handover.
-  const effectiveMinEl = minEl || 10;
-  const simTimeBucket = useQuantizedValue(simTime, 5);
+  const mode = conopsMode === "BBM" ? "BBM" : "MBB";
+  const isBBM = mode === "BBM";
 
   // Find the next handover for the analysis point
   const ho = useMemo(() => {
     if (!constellation) return null;
-    return findNextHandover(gpLat, gpLon, simTimeBucket, constellation, effectiveMinEl);
-  }, [simTimeBucket, gpLat, gpLon, constellation, effectiveMinEl]);
+    return findNextHandover(gpLat, gpLon, simTime, constellation, minEl || 10);
+  }, [simTime, gpLat, gpLon, constellation, minEl]);
 
   const overlap = useMemo(() => {
     if (!ho) return null;
-    return computeOverlapWindow(ho, gpLat, gpLon, constellation, effectiveMinEl);
-  }, [ho, gpLat, gpLon, constellation, effectiveMinEl]);
+    return computeOverlapWindow(ho, gpLat, gpLon, constellation, minEl || 10);
+  }, [ho, gpLat, gpLon, constellation, minEl]);
+
+  // BBM v4.23: state from the BBM engine (only meaningful when isBBM)
+  const bbmState = useMemo(() => {
+    if (!ho || !isBBM) return null;
+    const beamIds = Array.from(
+      { length: Math.min(constellation.beamsPerSubRegion, 8) }, (_, i) => i + 1
+    );
+    return getHandoverState_BBM(simTime, ho, constellation, beamIds, { warmStart: warmStart !== false });
+  }, [ho, isBBM, simTime, constellation, warmStart]);
+
+  // Reclaimed-capacity rollup (constellation-wide, only meaningful when isBBM)
+  const reclaim = useMemo(() => {
+    if (!isBBM || !aeroBeamsCount) return null;
+    return rollupReclaimedCapacity(constellation, aeroBeamsCount);
+  }, [isBBM, constellation, aeroBeamsCount]);
 
   const xml = useMemo(() => {
     if (!ho) return "";
     const beamCount = constellation.beamsPerSubRegion;
     const beamIds = Array.from({ length: beamCount }, (_, i) => i + 1);
     return buildScheduleXML(
-      { id: `TERM_${gpLat.toFixed(0)}_${gpLon.toFixed(0)}`, lat: gpLat, lon: gpLon, minEl: effectiveMinEl },
+      { id: `TERM_${gpLat.toFixed(0)}_${gpLon.toFixed(0)}`, lat: gpLat, lon: gpLon, minEl: minEl || 10 },
       constellation,
-      simTimeBucket,
+      simTime,
       4 * 3600,
       beamIds,
       "R01A"
     );
-  }, [ho, constellation, simTimeBucket, gpLat, gpLon, effectiveMinEl]);
+  }, [ho, constellation, simTime, gpLat, gpLon, minEl]);
 
   const handleCopy = useCallback(() => {
     if (typeof navigator !== "undefined" && navigator.clipboard) {
       navigator.clipboard.writeText(xml).then(() => {
         setCopied(true);
-        // v4.22.1 (review NEW-3): cancel previous reset timer before scheduling a new one.
-        if (copiedTimeoutRef.current) clearTimeout(copiedTimeoutRef.current);
-        copiedTimeoutRef.current = setTimeout(() => {
-          copiedTimeoutRef.current = null;
-          setCopied(false);
-        }, 1500);
+        setTimeout(() => setCopied(false), 1500);
       });
     }
   }, [xml]);
@@ -6580,7 +6652,9 @@ function O3bHandoverTimelinePanel({ simTime, gpLat, gpLon, constellation, minEl 
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
           <div>
             <div style={{color:"#5a7090",fontSize:"11px",letterSpacing:"1.5px",fontWeight:"600"}}>
-              DOCUMENTED HANDOVER TIMELINE · v4.22
+              {isBBM
+                ? "BBM AERO HANDOVER TIMELINE · v4.23 · single-receiver"
+                : "DOCUMENTED HANDOVER TIMELINE · v4.23 · MBB dual-antenna"}
             </div>
             <div style={{color:"#cfe2ff",fontSize:"12px",marginTop:"3px"}}>
               Next handover in <span style={{color:"#00cfff",fontWeight:"bold"}}>{minToHandover.toFixed(1)} min</span> ·{" "}
@@ -6607,10 +6681,39 @@ function O3bHandoverTimelinePanel({ simTime, gpLat, gpLon, constellation, minEl 
         </div>
       </div>
 
-      {/* KPI strip */}
+      {/* KPI strip — mode-aware (v4.23) */}
       <div style={{padding:"12px 16px",background:"#0f1d2e",borderLeft:"1px solid #1a2d44",borderRight:"1px solid #1a2d44",
                    display:"grid",gridTemplateColumns:"repeat(4, 1fr)",gap:"12px"}}>
-        {[
+        {(isBBM ? [
+          {
+            label:"Acquisition gap",
+            value:`${(bbmState?.acquisitionGap ?? BBM_HANDOVER_TIMING.ACQUISITION_GAP_WARM_TARGET_SEC).toFixed(0)} s`,
+            sub: warmStart !== false
+              ? "Warm-start target · vendor RFC required"
+              : "Cold reacquire · matches MODEM_LOCK_SEC",
+            ok: warmStart !== false,
+          },
+          {
+            label:"Reclaimed / handover",
+            value:`${BBM_HANDOVER_TIMING.RECLAIMED_DUAL_CARRIER_SEC} s`,
+            sub:"30 s setting + 30 s rising (aero-dedicated)",
+            ok:true,
+          },
+          {
+            label:"Constellation reclaim",
+            value: reclaim ? `${reclaim.carrierEquivalents.toFixed(2)} carriers` : "n/a",
+            sub: reclaim
+              ? `${aeroBeamsCount} aero-dedicated beams · ${reclaim.handoversPerBeamDay.toFixed(1)} HO/day`
+              : "set aeroBeamsCount prop to enable",
+            ok: null,
+          },
+          {
+            label:"Beam stagger",
+            value:`${BBM_HANDOVER_TIMING.BEAM_STAGGER_SEC.toFixed(2)} s`,
+            sub:"O3B-SAT-TRD-REQ-1 · still applies",
+            ok:true,
+          },
+        ] : [
           {
             label:"Overlap window",
             value:`${overlap.durationSec.toFixed(1)} s`,
@@ -6635,7 +6738,7 @@ function O3bHandoverTimelinePanel({ simTime, gpLat, gpLon, constellation, minEl 
             sub:"Demod-B locked on rising",
             ok:null,
           },
-        ].map((k, i) => (
+        ]).map((k, i) => (
           <div key={i} style={{
             background:"rgba(255,255,255,0.02)",
             borderLeft:`2px solid ${k.ok===true?"#7fff00":k.ok===false?"#ff4444":"#00cfff"}`,
@@ -6751,9 +6854,48 @@ function O3bHandoverTimelinePanel({ simTime, gpLat, gpLon, constellation, minEl 
           {/* Step labels */}
           <g fontSize="9" fill="#5a7090" fontWeight="600" letterSpacing="1">
             <text x={(xAt(-60)+xAt(0))/2}  y="14" textAnchor="middle">STEP 1 · PRE-HANDOVER</text>
-            <text x={(xAt(0)+xAt(30))/2}   y="14" textAnchor="middle">STEP 2 + 3 · HANDOVER + OVERLAP</text>
+            <text x={(xAt(0)+xAt(30))/2}   y="14" textAnchor="middle">
+              {isBBM ? "STEP 2 · OUTAGE + REACQ" : "STEP 2 + 3 · HANDOVER + OVERLAP"}
+            </text>
             <text x={(xAt(60)+xAt(90))/2}  y="14" textAnchor="middle">STEP 4 · POST-HANDOVER</text>
           </g>
+
+          {/* BBM v4.23 overlay — drawn on top of the MBB layout so the diff
+              between the two conops is visually obvious. */}
+          {isBBM && bbmState && (
+            <g>
+              {/* Hide ANT2 band — single-receiver aero has no second antenna */}
+              <rect x={xAt(-60)} y="204" width={xAt(90)-xAt(-60)} height="28"
+                    fill="#0f1d2e" stroke="#3a5a7a" strokeWidth="1" strokeDasharray="3,3"/>
+              <text x={(xAt(-60)+xAt(90))/2} y="222" fontSize="10"
+                    fill="#5a7090" textAnchor="middle" fontStyle="italic">
+                No ANT2 — single modem receiver
+              </text>
+
+              {/* Replace OVERLAP hatch with OUTAGE rect (T=0 → T=acquisitionGap) */}
+              <rect x={xAt(0)} y="128" width={xAt(bbmState.acquisitionGap)-xAt(0)} height="22"
+                    fill="#ff444433" stroke="#ff4444" strokeWidth="1.5"/>
+              <text x={(xAt(0)+xAt(bbmState.acquisitionGap))/2} y="143"
+                    fontSize="10" fill="#ff4444" fontWeight="600" textAnchor="middle">
+                OUTAGE ({bbmState.acquisitionGap.toFixed(0)} s)
+              </text>
+
+              {/* REACQ rect after the gap, up to T=+30s */}
+              <rect x={xAt(bbmState.acquisitionGap)} y="128"
+                    width={xAt(30)-xAt(bbmState.acquisitionGap)} height="22"
+                    fill="#ffbf0033" stroke="#ffbf00" strokeWidth="1"/>
+              <text x={(xAt(bbmState.acquisitionGap)+xAt(30))/2} y="143"
+                    fontSize="10" fill="#ffbf00" fontWeight="600" textAnchor="middle">
+                REACQ
+              </text>
+
+              {/* Reclaimed-carrier annotation */}
+              <text x={xAt(60)} y="160" fontSize="9" fill="#7fff00" textAnchor="start">
+                ↳ {BBM_HANDOVER_TIMING.RECLAIMED_DUAL_CARRIER_SEC} s dual-carrier presence reclaimed
+                {" "}(aero-dedicated only)
+              </text>
+            </g>
+          )}
         </svg>
 
         {/* Legend */}
@@ -6789,9 +6931,6 @@ export default function O3bSimulator() {
   const animRef    = useRef(null);
   const lastMs     = useRef(null);
   const simTimeRef = useRef(0);
-  // v4.22.1 (ported from v4.21.3): debounce duplicate OpenSky /tracks/all calls.
-  // Set true while loadRealFlightTrack is in flight; further invocations no-op.
-  const trackLoadingRef = useRef(false);
 
   // ── Responsive viewport tracking ──────────────────────────
   const [vw, setVw] = useState(typeof window !== "undefined" ? window.innerWidth  : 1280);
@@ -6823,6 +6962,15 @@ export default function O3bSimulator() {
   // Constellation mode — switchable between live mPOWER and documented O3b classic.
   // Flipping this also forces numSats to the canonical N for that constellation.
   const [constellationId, setConstellationId] = useState("MPOWER");
+  // v4.23: ConOps mode for the handover timeline panel.
+  // "MBB" = documented dual-antenna make-before-break (today's conops).
+  // "BBM" = single-receiver aero break-before-make (new aero conops).
+  const [conopsMode, setConopsMode] = useState("MBB");
+  const [warmStart, setWarmStart] = useState(true);
+  // Default aero-dedicated beam count per the OpenSky-anchored central case
+  // in Aero_BBM_Conops_Brief_v2.docx (Classic: 24 / mPOWER: 38). Surfaced as
+  // state so engineering can sweep the constellation reclaim KPI live.
+  const [aeroBeamsCount, setAeroBeamsCount] = useState(24);
   const constellation = useMemo(
     () => CONSTELLATIONS[constellationId] || CONSTELLATIONS.MPOWER,
     [constellationId]
@@ -6891,10 +7039,6 @@ export default function O3bSimulator() {
   const [recentAirports,    setRecentAirports]    = useState(() => lsGet(LS_RECENT_AIRPORTS, [])); // (E) persisted
   const [recentFlights,     setRecentFlights]     = useState(() => lsGet(LS_RECENT_FLIGHTS, []));
   const [flightSelecting, setFlightSelecting_] = useState(null); // "origin" | "dest" | null
-  // v4.22.1 (review H3): ref declared *before* the wrapper that uses it.
-  // Previously this lived ~20 lines below; the working code only worked
-  // because function declarations are hoisted within their scope.
-  const flightSelectingRef = useRef(null);
   // Wrapper keeps the ref in sync for the onPinDrop closure
   function setFlightSelecting(v) { flightSelectingRef.current = v; setFlightSelecting_(v); }
   const [aptQ1, setAptQ1] = useState("");  // airport search query — origin
@@ -6914,7 +7058,7 @@ export default function O3bSimulator() {
   const satNames = useMemo(() => getSatNames(numSats), [numSats]);
   const satSpacing = (360 / numSats).toFixed(1);
 
-  // v4.22.1 (review H3): flightSelectingRef now declared above with setFlightSelecting.
+  const flightSelectingRef = useRef(null); // ref mirror of flightSelecting for onPinDrop closure
   const onPinDrop = useCallback(({ lat, lon }) => {
     const sel = flightSelectingRef.current;
     const label = `${Math.abs(lat).toFixed(2)}${lat>=0?"N":"S"} ${Math.abs(lon).toFixed(2)}${lon>=0?"E":"W"}`;
@@ -7044,52 +7188,23 @@ export default function O3bSimulator() {
   // Fetch the actual ADS-B track for a selected flight, downsample to ~200 pts,
   // and bind origin/dest from the airport database.
   async function loadRealFlightTrack(flight) {
-    // v4.22.1 (ported from v4.21.3): debounce — if a track fetch is already in
-    // flight, ignore subsequent clicks (covers both search-results list and
-    // recent-flights chip buttons).
-    if (trackLoadingRef.current) return;
-    trackLoadingRef.current = true;
     setRealFlightLoading(true);
     setRealFlightError(null);
     try {
       // Use middle-of-flight time for the tracks call
       const midTime = Math.floor((flight.firstSeen + flight.lastSeen) / 2);
       const url = `${OPENSKY_PROXY}/api/tracks/all?icao24=${encodeURIComponent(flight.icao24)}&time=${midTime}`;
-      // v4.22.1 (ported from v4.21.3): session cache — re-selecting the same
-      // flight in this session bypasses the network. Key is deterministic from
-      // icao24 + midTime (derived from firstSeen/lastSeen, so stable per flight).
-      const cacheKey = `opensky-track:${flight.icao24}:${midTime}`;
-      let text = null;
-      try {
-        if (typeof sessionStorage !== "undefined") {
-          text = sessionStorage.getItem(cacheKey);
+      const res = await fetch(url);
+      if (!res.ok) {
+        if (res.status === 404) {
+          throw new Error("No ADS-B track recorded for this flight (gap in coverage).");
         }
-      } catch { /* sessionStorage may be unavailable in some sandboxes */ }
-      if (text === null) {
-        const res = await fetch(url);
-        if (!res.ok) {
-          if (res.status === 404) {
-            throw new Error("No ADS-B track recorded for this flight (gap in coverage).");
-          }
-          if (res.status === 403) {
-            throw new Error("OpenSky rate-limited or auth issue (HTTP 403). Try again later.");
-          }
-          if (res.status === 429) {
-            throw new Error("OpenSky rate limit hit (HTTP 429). Wait ~1 minute and retry, or pick a flight you've already loaded (cached).");
-          }
-          if (res.status >= 500) {
-            throw new Error(`OpenSky service error (HTTP ${res.status}). Try again in a moment.`);
-          }
-          throw new Error(`HTTP ${res.status}`);
+        if (res.status === 403) {
+          throw new Error("OpenSky rate-limited or auth issue (HTTP 403). Try again later.");
         }
-        text = await res.text();
-        // Cache the raw response so re-clicks bypass the network entirely.
-        try {
-          if (typeof sessionStorage !== "undefined") {
-            sessionStorage.setItem(cacheKey, text);
-          }
-        } catch { /* quota exceeded or storage disabled — non-fatal */ }
+        throw new Error(`HTTP ${res.status}`);
       }
+      const text = await res.text();
       let data;
       try { data = JSON.parse(text); } catch { throw new Error("Invalid JSON track response"); }
       if (!data || !Array.isArray(data.path) || data.path.length < 2) {
@@ -7165,7 +7280,6 @@ export default function O3bSimulator() {
       setRealFlightError(msg);
     } finally {
       setRealFlightLoading(false);
-      trackLoadingRef.current = false; // v4.22.1 (ported from v4.21.3): release debounce
     }
   }
 
@@ -7261,14 +7375,11 @@ export default function O3bSimulator() {
     };
   }, [flightMode, flightOrigin, flightDest, flightStartTime, simTime, realFlightTrack]);
 
-  // When flight is active, update analysis point to track the plane.
-  // v4.22.1 (review M1): coarsen to 2 decimals (~1 km). React's setState bails
-  // out when the new primitive === current, so a slow-moving aircraft no longer
-  // triggers downstream re-renders on every 33 ms animation tick.
+  // When flight is active, update analysis point to track the plane
   useEffect(() => {
     if (flightData && !flightData.complete) {
-      setGpLat(+flightData.pos.lat.toFixed(2));
-      setGpLon(+flightData.pos.lon.toFixed(2));
+      setGpLat(+flightData.pos.lat.toFixed(3));
+      setGpLon(+flightData.pos.lon.toFixed(3));
     }
   }, [flightData]);
 
@@ -7282,11 +7393,10 @@ export default function O3bSimulator() {
     const SAT_HYS = 2, GW_HYS = 3;
     let prevSatIdx = -1, prevGwId = null;
 
-    // Three coverage tiers — each independently tracked. Thresholds are
-    // user-configurable; default values noted in parens for orientation.
-    //  1. Constellation       — best satellite EL ≥ gwMinEl     (default 10°)
-    //  2. Ka2517 terminal     — best satellite EL ≥ ka2517MinEl (default 20°)
-    //  3. End-to-end service  — Tier-2 viable AND an active gateway sees the same satellite at ≥ gwMinEl
+    // Three coverage tiers — each independently tracked:
+    //  1. Constellation  — any satellite EL > 5° (pure orbital geometry)
+    //  2. Ka2517 terminal — best sat EL ≥ 15° (within scan floor, regardless of GW)
+    //  3. End-to-end service — EL ≥ 15° AND an active gateway sees the satellite
     let covCount = 0, terminalCovCount = 0, e2eCovCount = 0;
     // Alternative satellite tracking: during "no active gateway" closures,
     // track terminal EL of the sat that HAS gw coverage (below ka2517MinEl)
@@ -7486,10 +7596,10 @@ export default function O3bSimulator() {
     return {
       origin: flightOrigin, dest: flightDest,
       dist, durationSec, durationHours, speedKmh: FLIGHT_SPEED_KMH,
-      // Three-tier coverage (thresholds are user-configurable; defaults in parens)
-      covPct,          // Tier 1: constellation (best sat EL ≥ gwMinEl, default 10°)
-      terminalCovPct,  // Tier 2: Ka2517 terminal viable (best sat EL ≥ ka2517MinEl, default 20°)
-      e2eCovPct,       // Tier 3: end-to-end (Tier-2 viable AND an active GW sees same sat)
+      // Three-tier coverage
+      covPct,          // Tier 1: constellation (any sat EL > 5°)
+      terminalCovPct,  // Tier 2: Ka2517 terminal viable (EL ≥ 15°)
+      e2eCovPct,       // Tier 3: end-to-end with active gateway
       serviceCovPct: e2eCovPct, // alias used elsewhere in JSX
       // Elevation stats (over terminal-viable samples)
       minEl: terminalCovCount > 0 ? +minEl.toFixed(1) : 0,
@@ -7509,11 +7619,7 @@ export default function O3bSimulator() {
       numSats,
       activeGwCount: activeGateways.length,
     };
-    // v4.22.1 (review M2): simTime intentionally OMITTED from deps. The sweep
-    // covers the whole flight from flightStartTime → flightStartTime+durationSec
-    // and doesn't depend on the current playback cursor. Including simTime made
-    // this 400-iteration sweep re-run ~30×/sec while playback was active.
-  }, [tab, flightMode, flightOrigin, flightDest, flightStartTime, numSats, activeGateways, gwMinEl, ka2517MinEl, realFlightTrack]);
+  }, [tab, flightMode, flightOrigin, flightDest, flightStartTime, simTime, numSats, activeGateways, gwMinEl, ka2517MinEl, realFlightTrack]);
 
   // Resource chart data — precomputed 400-sample sweep for Tab 6 chart + pairing table
   const resourceData = useMemo(() => {
@@ -7528,8 +7634,6 @@ export default function O3bSimulator() {
     const satHandoffs = [], gwHandoffs = [];
     let worstFwd = 0, worstRtn = 0, worstFwdPair = "", worstRtnPair = "";
     let covCount = 0;
-    // v4.22.1 (review M4): hoist sat-name list out of the 400-iteration loop.
-    const satNamesLocal = getSatNames(numSats);
 
     for (let i = 0; i <= N; i++) {
       const f = i / N;
@@ -7584,7 +7688,7 @@ export default function O3bSimulator() {
 
       // Accumulate pairing
       if (activeGwId && activeSat >= 0) {
-        const satName = satNamesLocal[activeSat]; // v4.22.1 (review M4)
+        const satName = getSatNames(numSats)[activeSat];
         const key = `${satName}|${activeGwId}`;
         const gwObj = activeGateways.find(g => g.id === activeGwId);
         if (!pairings.has(key)) {
@@ -9661,13 +9765,61 @@ export default function O3bSimulator() {
               </div>
             )}
 
-            {/* ════ v4.22: Documented O3b Handover Timeline ════ */}
+            {/* ════ v4.23: ConOps mode toggle (MBB / BBM) ════ */}
+            <div style={{
+              marginTop:"16px",padding:"10px 14px",background:"#0f1d2e",
+              border:"1px solid #1a2d44",borderRadius:"4px",
+              display:"flex",alignItems:"center",gap:"16px",flexWrap:"wrap",
+            }}>
+              <div style={{color:"#5a7090",fontSize:"10px",letterSpacing:"1.5px",fontWeight:"600"}}>
+                CONOPS MODE
+              </div>
+              <div style={{display:"flex",gap:"4px"}}>
+                {["MBB", "BBM"].map((m) => (
+                  <button key={m} onClick={() => setConopsMode(m)}
+                    style={{
+                      background: conopsMode === m ? "#00cfff22" : "#080f1a",
+                      border: `1px solid ${conopsMode === m ? "#00cfff" : "#2e4270"}`,
+                      color: conopsMode === m ? "#00cfff" : "#8ab0d0",
+                      padding:"5px 14px",fontSize:"11px",fontFamily:"inherit",
+                      cursor:"pointer",borderRadius:"3px",fontWeight:"600",
+                    }}>
+                    {m === "MBB" ? "MBB (dual antenna)" : "BBM (single-RX aero)"}
+                  </button>
+                ))}
+              </div>
+              {conopsMode === "BBM" && (
+                <>
+                  <label style={{color:"#cfe2ff",fontSize:"11px",display:"flex",alignItems:"center",gap:"6px",cursor:"pointer"}}>
+                    <input type="checkbox" checked={warmStart}
+                           onChange={(e) => setWarmStart(e.target.checked)}
+                           style={{cursor:"pointer"}}/>
+                    Warm-start acquisition (engineering target)
+                  </label>
+                  <label style={{color:"#cfe2ff",fontSize:"11px",display:"flex",alignItems:"center",gap:"6px"}}>
+                    Aero-dedicated beams:
+                    <input type="number" min="0" max="200" value={aeroBeamsCount}
+                           onChange={(e) => setAeroBeamsCount(Math.max(0, +e.target.value || 0))}
+                           style={{width:"60px",background:"#080f1a",border:"1px solid #2e4270",
+                                   color:"#cfe2ff",padding:"3px 6px",fontSize:"11px",fontFamily:"inherit",borderRadius:"3px"}}/>
+                    <span style={{color:"#5a7090",fontSize:"9px"}}>
+                      (brief central: Classic 24 / mPOWER 38)
+                    </span>
+                  </label>
+                </>
+              )}
+            </div>
+
+            {/* ════ v4.23: Handover Timeline (MBB or BBM, mode-aware) ════ */}
             <O3bHandoverTimelinePanel
               simTime={simTime}
               gpLat={gpLat}
               gpLon={gpLon}
               constellation={constellation}
               minEl={ka2517MinEl}
+              conopsMode={conopsMode}
+              warmStart={warmStart}
+              aeroBeamsCount={aeroBeamsCount}
             />
 
           </div>
